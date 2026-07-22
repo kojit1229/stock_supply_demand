@@ -318,3 +318,145 @@ def run_backfill(
         raise BackfillError("min_issue_countは1以上の整数である必要があります")
 
     output_root = Path(out_dir)
+    cache_root = Path(cache_dir)
+    weekly_dir = output_root / "weekly"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    fetcher = downloader or CachedDownloader()
+    failures: list[str] = []
+    processed: list[str] = []
+    candidates: list[WeeklyCandidate] = []
+
+    with tempfile.TemporaryDirectory(prefix="jsda-backfill-") as temp_name:
+        extract_root = Path(temp_name)
+        for archive_name in archive_names(start, end, effective_today):
+            try:
+                archive_path = fetcher.fetch(
+                    urljoin(FILES_URL, archive_name), cache_root / archive_name
+                )
+                candidates.extend(
+                    _extract_archive_candidates(archive_path, extract_root, start, end)
+                )
+            except Exception as exc:
+                failures.append(f"{archive_name}: {exc}")
+
+        current_half = _half_start(effective_today)
+        if end >= current_half:
+            try:
+                index_path = fetcher.fetch(
+                    INDEX_URL, cache_root / f"index-{effective_today.isoformat()}.html"
+                )
+                # Link targets are ASCII; replacement keeps discovery working even
+                # if JSDA changes the surrounding Japanese page encoding.
+                index_html = index_path.read_bytes().decode("utf-8", errors="replace")
+                for report_date, url in sorted(discover_z_urls(index_html).items()):
+                    if not (start <= report_date <= end and report_date >= current_half):
+                        continue
+                    filename = Path(unquote(urlparse(url).path)).name
+                    try:
+                        source_path = fetcher.fetch(url, cache_root / filename)
+                        zname = parse_z_name(filename)
+                        if zname is None:
+                            raise BackfillError(f"zファイル名ではありません: {filename}")
+                        candidates.append(WeeklyCandidate(zname, source_path))
+                    except Exception as exc:
+                        failures.append(f"{report_date.isoformat()} ({filename}): {exc}")
+            except Exception as exc:
+                failures.append(f"index: {exc}")
+
+        try:
+            selected = _merge_candidates(candidates)
+        except Exception as exc:
+            failures.append(f"候補選別: {exc}")
+            selected = {}
+
+        if not selected and not failures:
+            failures.append(f"{start.isoformat()}..{end.isoformat()}: 対象zファイルがありません")
+
+        for report_date, candidate in sorted(selected.items()):
+            week_text = report_date.isoformat()
+            destination = weekly_dir / f"{week_text}.json"
+            try:
+                document = jsda_weekly.build_z_weekly(
+                    candidate.path,
+                    week_text,
+                    min_issue_count=minimum,
+                )
+                _write_weekly(destination, document)
+                processed.append(week_text)
+            except Exception as exc:
+                failure = f"{week_text} ({candidate.zname.filename}): {exc}"
+                try:
+                    destination.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as remove_exc:
+                    failure += f"; 既存出力も削除できません: {remove_exc}"
+                failures.append(failure)
+
+    if not failures:
+        try:
+            build_site.build_site(weekly_dir, output_root, _generated_at())
+        except Exception as exc:
+            failures.append(f"build_site: {exc}")
+    return BackfillResult(processed, failures)
+
+
+def _parse_cli_date(value: str, label: str) -> date:
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise BackfillError(f"{label}はYYYY-MM-DD形式で指定してください: {value!r}") from exc
+    if parsed.isoformat() != value:
+        raise BackfillError(f"{label}はYYYY-MM-DD形式で指定してください: {value!r}")
+    return parsed
+
+
+def _three_years_before(day: date) -> date:
+    try:
+        return day.replace(year=day.year - DEFAULT_YEARS)
+    except ValueError:
+        # February 29 has no counterpart in most prior years.
+        return day.replace(year=day.year - DEFAULT_YEARS, day=28)
+
+
+def _main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="JSDA半期zipから週次貸借残高とseries shardを再構築します"
+    )
+    parser.add_argument("--start", help="開始報告日 (YYYY-MM-DD)")
+    parser.add_argument("--end", help="終了報告日 (YYYY-MM-DD)")
+    parser.add_argument("--out", default="data", help="出力dataディレクトリ")
+    parser.add_argument(
+        "--cache-dir", default="data/_cache", help="ダウンロードキャッシュ"
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        end = _parse_cli_date(args.end, "end") if args.end else date.today()
+        start = (
+            _parse_cli_date(args.start, "start")
+            if args.start
+            else _three_years_before(end)
+        )
+        result = run_backfill(start, end, args.out, args.cache_dir)
+    except (BackfillError, OSError) as exc:
+        print(f"backfill_jsda: {exc}", file=sys.stderr)
+        return 1
+
+    if result.failures:
+        processed = ", ".join(result.processed_weeks) if result.processed_weeks else "なし"
+        print(f"backfill_jsda: 処理済み週: {processed}", file=sys.stderr)
+        print("backfill_jsda: 失敗週/取得元:", file=sys.stderr)
+        for failure in result.failures:
+            print(f"  - {failure}", file=sys.stderr)
+        return 1
+
+    print(
+        f"backfill_jsda: {len(result.processed_weeks)}週を処理しました "
+        f"({result.processed_weeks[0]}..{result.processed_weeks[-1]})"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
