@@ -299,8 +299,11 @@
     const DATA_PATHS = Object.freeze({
       meta: 'data/meta.json',
       issues: 'data/issues.json',
-      series: function (shard) { return 'data/series/' + shard + '.json'; }
+      series: function (shard) { return 'data/series/' + shard + '.json'; },
+      short: function (shard) { return 'data/short/' + shard + '.json'; },
+      shortMeta: 'data/short_meta.json'
     });
+    const SHORT_HISTORY_LIMIT = 20;
     const SERIES = Object.freeze([
       { key: 'lend_qty', label: '貸付残高', color: '#E85D4A' },
       { key: 'own_qty', label: '借入（自己）', color: '#E6B85C' },
@@ -392,6 +395,9 @@
       query: '',
       route: { type: 'search' },
       seriesCache: new Map(),
+      shortCache: new Map(),
+      shortMeta: null,
+      shortMetaFetched: false,
       currentChart: null,
       routeRequest: 0,
       resizeFrame: 0
@@ -435,6 +441,113 @@
       }
       state.seriesCache.set(shard, payload);
       return payload;
+    }
+
+    async function loadShortShard(shard) {
+      if (!/^[A-Za-z0-9_-]+$/.test(shard)) throw new Error('shard名が不正です。');
+      if (state.shortCache.has(shard)) return state.shortCache.get(shard);
+      const response = await fetch(DATA_PATHS.short(shard), { headers: { Accept: 'application/json' } });
+      if (response.status === 404) {
+        state.shortCache.set(shard, null);
+        return null;
+      }
+      if (!response.ok) throw new Error('空売りデータの取得に失敗しました (' + response.status + ')');
+      const payload = await response.json();
+      if (!payload || !payload.issues || typeof payload.issues !== 'object') throw new Error('空売りデータの形式が不正です。');
+      state.shortCache.set(shard, payload);
+      return payload;
+    }
+
+    async function loadShortMeta() {
+      if (state.shortMetaFetched) return state.shortMeta;
+      state.shortMetaFetched = true;
+      try {
+        const payload = await fetchJson(DATA_PATHS.shortMeta);
+        if (payload && typeof payload.latest_short_date === 'string') state.shortMeta = payload;
+      } catch (error) {
+        state.shortMeta = null;
+      }
+      return state.shortMeta;
+    }
+
+    function formatRatioPercent(value) {
+      if (!isNumber(value)) return '—';
+      return (Math.round(value * 10000) / 100).toFixed(2) + '%';
+    }
+
+    function shortSellerRows(events) {
+      const bySeller = Object.create(null);
+      events.forEach(function (event) {
+        const current = bySeller[event.seller];
+        if (!current || String(event.date) > String(current.date)) bySeller[event.seller] = event;
+      });
+      return Object.keys(bySeller).map(function (seller) { return bySeller[seller]; })
+        .sort(function (a, b) { return (b.ratio || 0) - (a.ratio || 0); });
+    }
+
+    function renderShortData(target, issue, metaLine) {
+      const events = (issue && Array.isArray(issue.events)) ? issue.events.filter(function (event) {
+        return event && typeof event.seller === 'string' && typeof event.date === 'string';
+      }) : [];
+      if (!events.length) {
+        target.innerHTML =
+          '<section class="card" aria-labelledby="short-title">' +
+            '<h2 id="short-title">大口空売り残高報告（0.5%以上）</h2>' + metaLine +
+            '<p class="section-subtitle">大口空売り報告なし（発行済株式の0.5%以上の報告対象外）</p>' +
+          '</section>';
+        return;
+      }
+      const sellers = shortSellerRows(events);
+      const sellerRows = sellers.map(function (event) {
+        return '<tr>' +
+          '<td>' + escapeHtml(event.seller) + '</td>' +
+          '<td>' + escapeHtml(event.date) + '</td>' +
+          '<td>' + formatRatioPercent(event.ratio) + '</td>' +
+          '<td>' + formatNumber(event.qty) + '</td>' +
+        '</tr>';
+      }).join('');
+      const history = events.slice().sort(function (a, b) {
+        return a.date === b.date ? (a.seller < b.seller ? -1 : 1) : (a.date < b.date ? 1 : -1);
+      }).slice(0, SHORT_HISTORY_LIMIT).map(function (event) {
+        return '<tr>' +
+          '<td>' + escapeHtml(event.date) + '</td>' +
+          '<td>' + escapeHtml(event.seller) + '</td>' +
+          '<td>' + formatRatioPercent(event.ratio) + '</td>' +
+          '<td>' + formatNumber(event.qty) + '</td>' +
+        '</tr>';
+      }).join('');
+      target.innerHTML =
+        '<section class="card" aria-labelledby="short-title">' +
+          '<h2 id="short-title">大口空売り残高報告（0.5%以上）</h2>' + metaLine +
+          '<p class="section-subtitle">報告者別の最新状況（割合は発行済株式数に対する空売り残高）</p>' +
+          '<div class="table-wrap"><table>' +
+            '<thead><tr><th scope="col">報告者</th><th scope="col">計算日</th><th scope="col">割合</th><th scope="col">数量（株）</th></tr></thead>' +
+            '<tbody>' + sellerRows + '</tbody>' +
+          '</table></div>' +
+          '<p class="section-subtitle">報告履歴（直近' + SHORT_HISTORY_LIMIT + '件）</p>' +
+          '<div class="table-wrap"><table>' +
+            '<thead><tr><th scope="col">計算日</th><th scope="col">報告者</th><th scope="col">割合</th><th scope="col">数量（株）</th></tr></thead>' +
+            '<tbody>' + history + '</tbody>' +
+          '</table></div>' +
+          '<p class="note">出典: 日本取引所グループ「空売り残高に関する情報」。0.5%未満へ減少した後の状況は報告されない点に注意</p>' +
+        '</section>';
+    }
+
+    async function renderShortSection(code, requestId) {
+      const target = document.getElementById('short-content');
+      if (!target) return;
+      try {
+        const results = await Promise.all([loadShortShard(code.slice(0, 2)), loadShortMeta()]);
+        if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
+        const shard = results[0];
+        const metaLine = state.shortMeta ? '<p class="section-subtitle">最新公表日: ' + escapeHtml(state.shortMeta.latest_short_date) + '</p>' : '';
+        const issue = shard && shard.issues ? shard.issues[code] : null;
+        renderShortData(target, issue, metaLine);
+      } catch (error) {
+        if (requestId !== state.routeRequest) return;
+        const current = document.getElementById('short-content');
+        if (current) current.innerHTML = '<div class="card status-card">空売りデータを取得できません。</div>';
+      }
     }
 
     // CHART
@@ -662,9 +775,11 @@
       app.innerHTML = freshnessMarkup() +
         '<a class="back-link" href="#/">← 銘柄検索へ</a>' +
         '<div class="issue-heading"><h1>' + escapeHtml(info.name) + '</h1><span class="issue-code">' + escapeHtml(code) + '</span></div>' +
-        '<div id="issue-content"><div class="card status-card">時系列データを読み込んでいます…</div></div>';
+        '<div id="issue-content"><div class="card status-card">時系列データを読み込んでいます…</div></div>' +
+        '<div id="short-content"><div class="card status-card">空売り報告を読み込んでいます…</div></div>';
 
       const requestId = ++state.routeRequest;
+      renderShortSection(code, requestId);
       try {
         const payload = await loadSeries(info.shard);
         if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
