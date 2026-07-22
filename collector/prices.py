@@ -398,3 +398,41 @@ def run_collect(
         total=len(codes),
         failures=tuple(failures),
         latest_price_date=latest_price_date,
+        removed=removed,
+    )
+
+
+def _main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="price_list.json記載銘柄の株価(週次3年+直近日次)を取得します"
+    )
+    parser.add_argument("--out", default="data", help="出力dataディレクトリ")
+    parser.add_argument(
+        "--list", default="config/price_list.json", help="対象銘柄リストJSON"
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None, help="先頭N銘柄だけ処理する(テスト・手動確認用)"
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        result = run_collect(args.out, args.list, limit=args.limit)
+    except Exception as exc:
+        print(f"prices: {exc}", file=sys.stderr)
+        return 1
+
+    if result.failures:
+        print(
+            f"prices: {len(result.failures)}銘柄の取得に失敗しました: "
+            f"{', '.join(result.failures)}",
+            file=sys.stderr,
+        )
+    print(
+        f"prices: {result.success_count}/{result.total}銘柄を更新しました "
+        f"(latest_price_date={result.latest_price_date})"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
