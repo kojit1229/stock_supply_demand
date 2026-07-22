@@ -198,3 +198,203 @@ def parse_chart_series(
         if dates and dates[-1] == day:
             if value is not None:
                 values[-1] = value
+        else:
+            dates.append(day)
+            values.append(value)
+
+    for previous, current in zip(dates, dates[1:]):
+        if current <= previous:
+            raise PriceCollectorError(f"{context}: 日付が昇順ではありません")
+
+    if len(dates) > window:
+        dates = dates[-window:]
+        values = values[-window:]
+    return dates, values
+
+
+def _request_json(opener: Callable[..., Any], url: str, *, context: str) -> Any:
+    request = Request(url, headers={"User-Agent": USER_AGENT})
+    with opener(request, timeout=REQUEST_TIMEOUT) as response:
+        raw = response.read()
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PriceCollectorError(f"{context}: レスポンスのJSONが不正です") from exc
+
+
+def _fetch_series(
+    opener: Callable[..., Any],
+    limiter: _RateLimiter,
+    sleep: Callable[[float], None],
+    symbol: str,
+    kind: str,
+    *,
+    range_: str,
+    interval: str,
+    window: int,
+) -> tuple[list[str], list[float | None]]:
+    url = f"{CHART_URL.format(symbol=symbol)}?range={range_}&interval={interval}"
+    context = f"{symbol} {kind}"
+    last_error: Exception | None = None
+    for attempt in range(MAX_ATTEMPTS):
+        limiter.wait()
+        try:
+            payload = _request_json(opener, url, context=context)
+            return parse_chart_series(payload, window=window, context=context)
+        except Exception as exc:  # retried uniformly; last attempt re-raises below
+            last_error = exc
+            if attempt < MAX_ATTEMPTS - 1:
+                sleep(MIN_REQUEST_INTERVAL * (2**attempt))
+    raise PriceCollectorError(
+        f"{context}: 取得に{MAX_ATTEMPTS}回失敗しました"
+    ) from last_error
+
+
+def _collect_one(
+    opener: Callable[..., Any],
+    limiter: _RateLimiter,
+    sleep: Callable[[float], None],
+    code: str,
+) -> tuple[dict[str, Any], str]:
+    symbol = f"{code}.T"
+    weekly_dates, weekly_close = _fetch_series(
+        opener, limiter, sleep, symbol, "weekly",
+        range_="3y", interval="1wk", window=WEEKLY_WINDOW,
+    )
+    daily_dates, daily_close = _fetch_series(
+        opener, limiter, sleep, symbol, "daily",
+        range_="1mo", interval="1d", window=DAILY_WINDOW,
+    )
+    document = {
+        "schema_version": PRICES_SCHEMA_VERSION,
+        "code": code,
+        "weekly": {"dates": weekly_dates, "close": weekly_close},
+        "daily": {"dates": daily_dates, "close": daily_close},
+    }
+    latest = max(weekly_dates[-1:] + daily_dates[-1:])
+    return document, latest
+
+
+def _write_json_atomic(path: Path, document: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+    temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _reconcile_removed_codes(prices_dir: Path, codes: list[str]) -> tuple[str, ...]:
+    """Delete prices/{code}.json for codes no longer in the (full) watchlist.
+
+    Only meaningful for a full run (no ``--limit``): a code dropped from
+    ``config/price_list.json`` would otherwise keep being served forever,
+    because ``weekly.yml`` restores the previous ``data/`` from gh-pages
+    before this script runs and this script never touches files it doesn't
+    know about. A code that is still in ``codes`` but failed this run is
+    preserved as before (it is never a candidate here, since it is present
+    in ``codes``).
+    """
+    if not prices_dir.is_dir():
+        return ()
+    keep = set(codes)
+    removed = []
+    for path in sorted(prices_dir.glob("*.json")):
+        if path.stem not in keep:
+            path.unlink()
+            removed.append(path.stem)
+    return tuple(removed)
+
+
+def run_collect(
+    out_dir: str | os.PathLike[str],
+    list_path: str | os.PathLike[str],
+    *,
+    limit: int | None = None,
+    opener: Callable[..., Any] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    monotonic: Callable[[], float] | None = None,
+    generated_at: str | None = None,
+) -> CollectResult:
+    """Fetch weekly/daily closes for every listed code and write prices/ + prices_meta.json.
+
+    A per-code failure is tolerated (existing ``prices/{code}.json`` is left in
+    place, or the code is skipped if there is none yet). If failures exceed
+    ``FAILURE_THRESHOLD`` of the requested codes, raises ``PriceCollectorError``
+    without writing ``prices_meta.json`` so the caller does not deploy.
+
+    Note: each successful code is written to ``prices/{code}.json`` as soon as
+    it is fetched, before the threshold check below runs. So when the
+    threshold check does raise, the healthy codes' files from this same run
+    are still left on disk. That is fine: this script exits non-zero in that
+    case, which fails the CI step and prevents weekly.yml's later Deploy step
+    from running, so nothing here gets published regardless.
+
+    Reconciliation: when ``limit`` is ``None`` (a full run) and the threshold
+    check above passes, any ``prices/{code}.json`` whose code is no longer in
+    ``config/price_list.json`` is deleted, so a code removed from the
+    watchlist eventually stops being served (``weekly.yml`` restores the
+    previous ``data/`` from gh-pages before every run, so nothing else would
+    ever remove it). A ``--limit`` run never deletes anything, since it only
+    ever sees a partial watchlist and would otherwise wipe out everything
+    outside that prefix.
+
+    ``opener``/``sleep``/``monotonic`` default to ``None`` (rather than
+    binding ``urlopen``/``time.sleep``/``time.monotonic`` directly as default
+    values) so tests can install a network guard or a fake clock by patching
+    this module's names; the real functions are looked up here, at call time,
+    exactly like ``collector.backfill_jsda.CachedDownloader`` does.
+    """
+    output_root = Path(out_dir)
+    prices_dir = output_root / "prices"
+    codes = _load_price_list(Path(list_path))
+    if limit is not None:
+        codes = codes[:limit]
+    if not codes:
+        raise PriceCollectorError("処理対象の銘柄コードがありません")
+
+    fetch_opener = opener or urlopen
+    fetch_sleep = sleep or time.sleep
+    fetch_monotonic = monotonic or time.monotonic
+    limiter = _RateLimiter(sleep=fetch_sleep, monotonic=fetch_monotonic)
+    failures: list[str] = []
+    latest_dates: list[str] = []
+    for code in codes:
+        try:
+            document, latest = _collect_one(fetch_opener, limiter, fetch_sleep, code)
+        except Exception as exc:
+            failures.append(code)
+            print(f"prices: {code}の取得に失敗しました: {exc}", file=sys.stderr)
+            continue
+        _write_json_atomic(prices_dir / f"{code}.json", document)
+        latest_dates.append(latest)
+
+    failure_ratio = len(failures) / len(codes)
+    if failure_ratio > FAILURE_THRESHOLD:
+        raise PriceCollectorError(
+            f"失敗銘柄が{len(failures)}/{len(codes)}件"
+            f"({failure_ratio:.0%})で許容閾値{FAILURE_THRESHOLD:.0%}を超えました: "
+            f"{', '.join(failures)}"
+        )
+
+    removed: tuple[str, ...] = ()
+    if limit is None:
+        removed = _reconcile_removed_codes(prices_dir, codes)
+        if removed:
+            print(
+                f"prices: リストから外れた{len(removed)}銘柄のファイルを削除しました: "
+                f"{', '.join(removed)}",
+                file=sys.stderr,
+            )
+
+    latest_price_date = max(latest_dates) if latest_dates else None
+    meta = {
+        "schema_version": PRICES_META_SCHEMA_VERSION,
+        "latest_price_date": latest_price_date,
+        "generated_at": generated_at or _generated_at(),
+        "price_count": len(codes) - len(failures),
+    }
+    _write_json_atomic(output_root / "prices_meta.json", meta)
+    return CollectResult(
+        total=len(codes),
+        failures=tuple(failures),
+        latest_price_date=latest_price_date,
