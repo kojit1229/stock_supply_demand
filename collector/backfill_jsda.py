@@ -97,10 +97,12 @@ class CachedDownloader:
         opener: Callable[..., object] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        user_agent: str = jsda_weekly.USER_AGENT,
     ) -> None:
         self._opener = opener or urlopen
         self._sleep = sleep
         self._monotonic = monotonic
+        self._user_agent = user_agent
         self._last_request_started: float | None = None
 
     def _wait_for_request_slot(self) -> None:
@@ -126,7 +128,7 @@ class CachedDownloader:
             self._wait_for_request_slot()
             self._last_request_started = self._monotonic()
             try:
-                request = Request(url, headers={"User-Agent": jsda_weekly.USER_AGENT})
+                request = Request(url, headers={"User-Agent": self._user_agent})
                 with self._opener(request, timeout=60) as response, temporary.open(
                     "wb"
                 ) as output:
