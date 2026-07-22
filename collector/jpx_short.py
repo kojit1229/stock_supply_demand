@@ -338,3 +338,243 @@ def _load_existing_shards(short_dir: Path) -> dict[str, dict[str, Any]]:
             raise JPXShortError(f"cannot read existing short shard: {path}") from exc
         if not isinstance(document, dict) or document.get("schema_version") != SHORT_SCHEMA_VERSION:
             raise JPXShortError(f"schema_version mismatch in existing shard: {path}")
+        shard_issues = document.get("issues")
+        if not isinstance(shard_issues, dict):
+            raise JPXShortError(f"invalid issues object in existing shard: {path}")
+        for code, issue in shard_issues.items():
+            normalized_code = _normalize_code(code)
+            if normalized_code != code or code[:2] != path.stem:
+                raise JPXShortError(f"code {code!r} is in the wrong shard: {path}")
+            if code in issues or not isinstance(issue, dict):
+                raise JPXShortError(f"duplicate or invalid existing issue: {code}")
+            name = _normalize_text(issue.get("name"), f"existing name for {code}")
+            events = issue.get("events")
+            if not isinstance(events, list):
+                raise JPXShortError(f"invalid existing events for {code}")
+            seen: set[tuple[str, str]] = set()
+            validated: list[dict[str, Any]] = []
+            for event in events:
+                clean = _validate_event(event, code)
+                key = (clean["date"], clean["seller"])
+                if key in seen:
+                    raise JPXShortError(f"duplicate existing event for {code}: {key!r}")
+                seen.add(key)
+                validated.append(clean)
+            validated.sort(key=lambda item: (item["date"], item["seller"]))
+            issues[code] = {"name": name, "events": validated}
+    return issues
+
+
+def _load_latest_short_date(meta_path: Path) -> date | None:
+    if not meta_path.exists():
+        return None
+    try:
+        document = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise JPXShortError(f"cannot read existing short meta: {meta_path}") from exc
+    if not isinstance(document, dict) or document.get("schema_version") != SHORT_META_SCHEMA_VERSION:
+        raise JPXShortError(f"schema_version mismatch in existing short meta: {meta_path}")
+    value = _parse_iso_date(document.get("latest_short_date"), "latest_short_date")
+    return date.fromisoformat(value)
+
+
+def _merge_issues(
+    destination: dict[str, dict[str, Any]],
+    source: dict[str, dict[str, Any]],
+) -> None:
+    for code, incoming in source.items():
+        current = destination.setdefault(code, {"name": incoming["name"], "events": []})
+        current["name"] = incoming["name"]
+        by_key = {
+            (event["date"], event["seller"]): event for event in current["events"]
+        }
+        for event in incoming["events"]:
+            by_key[(event["date"], event["seller"])] = event
+        current["events"] = sorted(
+            by_key.values(), key=lambda event: (event["date"], event["seller"])
+        )
+
+
+def _assemble_outputs(
+    issues: dict[str, dict[str, Any]], latest_short_date: date, generated_at: str
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    shards: dict[str, dict[str, Any]] = {}
+    for code in sorted(issues):
+        shards.setdefault(code[:2], {})[code] = issues[code]
+    documents = {
+        shard: {
+            "schema_version": SHORT_SCHEMA_VERSION,
+            "issues": shard_issues,
+        }
+        for shard, shard_issues in sorted(shards.items())
+    }
+    meta = {
+        "schema_version": SHORT_META_SCHEMA_VERSION,
+        "latest_short_date": latest_short_date.isoformat(),
+        "generated_at": generated_at,
+    }
+    return documents, meta
+
+
+def _write_outputs(
+    out_dir: Path,
+    shards: dict[str, dict[str, Any]],
+    meta: dict[str, Any],
+) -> None:
+    """Atomically replace only short/ and short_meta.json, with rollback."""
+    if out_dir.exists() and not out_dir.is_dir():
+        raise JPXShortError(f"output path is not a directory: {out_dir}")
+    rendered_shards = {
+        f"{shard}.json": json.dumps(
+            document, ensure_ascii=False, separators=(",", ":")
+        )
+        for shard, document in shards.items()
+    }
+    rendered_meta = json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
+
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".jpx-short-", dir=out_dir.parent))
+    created_out_dir = not out_dir.exists()
+    backups: list[tuple[Path, Path]] = []
+    committed: list[Path] = []
+    try:
+        staged_short = stage / "new" / "short"
+        staged_short.mkdir(parents=True)
+        for filename, text in rendered_shards.items():
+            (staged_short / filename).write_text(text, encoding="utf-8")
+        staged_meta = stage / "new" / "short_meta.json"
+        staged_meta.write_text(rendered_meta, encoding="utf-8")
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("short", "short_meta.json"):
+            target = out_dir / name
+            if target.exists() or target.is_symlink():
+                backup = stage / "old" / name
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(target, backup)
+                backups.append((backup, target))
+        for name in ("short", "short_meta.json"):
+            staged = stage / "new" / name
+            target = out_dir / name
+            os.replace(staged, target)
+            committed.append(target)
+    except Exception:
+        try:
+            for target in reversed(committed):
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                elif target.exists() or target.is_symlink():
+                    target.unlink()
+            for backup, target in reversed(backups):
+                if backup.exists() or backup.is_symlink():
+                    os.replace(backup, target)
+        except Exception as rollback_exc:
+            raise JPXShortError(
+                f"rollback failed; previous outputs preserved under {stage}"
+            ) from rollback_exc
+        if created_out_dir:
+            try:
+                out_dir.rmdir()
+            except OSError:
+                pass
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    else:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def _generated_at() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def run_update(
+    out_dir: str | os.PathLike[str],
+    cache_dir: str | os.PathLike[str],
+    *,
+    index_html_path: str | os.PathLike[str] | None = None,
+    downloader: CachedDownloader | None = None,
+    generated_at: str | None = None,
+) -> tuple[str, ...]:
+    """Discover and merge snapshots newer than short_meta.latest_short_date."""
+    output_root = Path(out_dir)
+    cache_root = Path(cache_dir)
+    latest = _load_latest_short_date(output_root / "short_meta.json")
+    fetcher = downloader or CachedDownloader(user_agent=JPX_USER_AGENT)
+
+    if index_html_path is None:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        today = datetime.now(timezone.utc).date().isoformat()
+        index_path = fetcher.fetch(
+            INDEX_URL, cache_root / f"jpx-short-index-{today}.html"
+        )
+    else:
+        index_path = Path(index_html_path)
+    try:
+        index_html = index_path.read_bytes().decode("utf-8", errors="replace")
+    except OSError as exc:
+        raise JPXShortError(f"cannot read JPX index HTML: {index_path}") from exc
+
+    discovered = discover_short_urls(index_html)
+    candidates = [
+        (publication_date, url)
+        for publication_date, url in sorted(discovered.items())
+        if latest is None or publication_date > latest
+    ]
+    if not candidates:
+        return ()
+
+    existing = _load_existing_shards(output_root / "short")
+    parsed_snapshots: list[tuple[date, dict[str, dict[str, Any]]]] = []
+    cache_root.mkdir(parents=True, exist_ok=True)
+    for publication_date, url in candidates:
+        filename = Path(unquote(urlparse(url).path)).name
+        source = fetcher.fetch(url, cache_root / filename)
+        parsed_snapshots.append((publication_date, parse_short_workbook(source)))
+
+    for _, snapshot in parsed_snapshots:
+        _merge_issues(existing, snapshot)
+    latest_processed = parsed_snapshots[-1][0]
+    timestamp = generated_at or _generated_at()
+    _validate_generated_at(timestamp)
+    shards, meta = _assemble_outputs(
+        existing, latest_processed, timestamp
+    )
+    _write_outputs(output_root, shards, meta)
+    return tuple(day.isoformat() for day, _ in parsed_snapshots)
+
+
+def _main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="JPX空売り残高報告からshort shardを増分更新します"
+    )
+    parser.add_argument("--out", default="data", help="出力dataディレクトリ")
+    parser.add_argument(
+        "--cache-dir", default="data/_cache", help="ダウンロードキャッシュ"
+    )
+    parser.add_argument(
+        "--index-html", help="オフライン用JPX index HTML (指定時はindexを取得しない)"
+    )
+    args = parser.parse_args(argv)
+    try:
+        updated = run_update(
+            args.out,
+            args.cache_dir,
+            index_html_path=args.index_html,
+        )
+    except Exception as exc:
+        print(f"jpx_short: {exc}", file=sys.stderr)
+        return 1
+    if updated:
+        print(
+            f"jpx_short: {len(updated)}公表日を更新しました "
+            f"({', '.join(updated)})"
+        )
+    else:
+        print("jpx_short: 対象なし")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
