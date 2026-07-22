@@ -198,3 +198,200 @@ def _parse_workbook(path: str | os.PathLike[str], kind: str) -> dict[str, dict[s
                     _to_int_or_none(
                         row[column],
                         allow_none=False,
+                        context=f"合計行 {column + 1}列目",
+                    )
+                    for column in _QUANTITY_COLUMNS
+                )
+                saw_total = True
+                continue
+
+            if saw_total:
+                raise JSDAParseError(f"合計行の後にデータがあります: {row_number}行目")
+
+            source_code = str(row[1]).strip()
+            code = _normalize_code(row[1])
+            name = _normalize_name(row[0])
+            collateral = _COLLATERAL_KEYS.get(row[2])
+            if collateral is None:
+                raise JSDAParseError(f"{row_number}行目の担保区分が不正です: {row[2]!r}")
+
+            parsed_numbers: dict[int, int | None] = {}
+            for column in _NUMERIC_COLUMNS:
+                parsed_numbers[column] = _to_int_or_none(
+                    row[column],
+                    allow_none=column in _CHANGE_COLUMNS,
+                    context=f"{row_number}行目 {column + 1}列目",
+                )
+
+            measurements = {
+                key: parsed_numbers[column] for key, column in _OUTPUT_COLUMNS.items()
+            }
+            issue = issues.setdefault(code, {"name": name, kind: {}})
+            if source_code in source_names and source_names[source_code] != name:
+                raise JSDAParseError(
+                    f"同一ソースコードの銘柄名が一致しません: {source_code} "
+                    f"({source_names[source_code]!r} != {name!r})"
+                )
+            source_names[source_code] = name
+
+            bucket_key = (code, collateral)
+            sources = bucket_sources.setdefault(bucket_key, set())
+            if source_code in sources:
+                raise JSDAParseError(
+                    f"担保区分が重複しています: {source_code} {row[2]}"
+                )
+            sources.add(source_code)
+            if collateral in issue[kind]:
+                raise JSDAParseError(
+                    f"同一銘柄・同一担保区分の行が重複しています: {code} {row[2]}"
+                )
+            issue[kind][collateral] = measurements
+
+            for index, column in enumerate(_QUANTITY_COLUMNS):
+                value = parsed_numbers[column]
+                if not isinstance(value, int):
+                    raise JSDAParseError(
+                        f"{row_number}行目 {column + 1}列目の数量が整数ではありません: {value!r}"
+                    )
+                quantity_sums[index] += value
+            data_count += 1
+
+        if data_count == 0:
+            raise JSDAParseError("データ行が0件です")
+        if total_quantities is None:
+            raise JSDAParseError("合計行がありません")
+        if tuple(quantity_sums) != total_quantities:
+            labels = ("貸付数量", "借入(自己)数量", "借入(転貸)数量")
+            differences = ", ".join(
+                f"{label}: 明細={actual}, 合計行={expected}"
+                for label, actual, expected in zip(labels, quantity_sums, total_quantities)
+                if actual != expected
+            )
+            raise JSDAParseError(f"数量合計が一致しません: {differences}")
+        return issues
+    finally:
+        workbook.close()
+
+
+def parse_zandaka(path: str | os.PathLike[str]) -> dict[str, dict[str, Any]]:
+    """Parse a JSDA weekend-balance workbook into the weekly issues shape."""
+    return _parse_workbook(path, "taishaku")
+
+
+def parse_shinki(path: str | os.PathLike[str]) -> dict[str, dict[str, Any]]:
+    """Parse a JSDA weekly-new-contract workbook into the weekly issues shape."""
+    return _parse_workbook(path, "shinki")
+
+
+def _validate_source_filename(
+    path: str | os.PathLike[str], kind_char: str, report_date: str
+) -> None:
+    """ファイル名(報告日の正本)が report_date と種別に一致することを検証する。
+
+    命名は ``YYYYMMDD{j,s,z}``。訂正版 ``20260501z(20260514r).xlsx`` や
+    フィクスチャの ``20260710z_sample.xlsx`` のような接尾辞は許容する。
+    """
+    name = Path(path).name
+    match = re.match(r"^(\d{8})([jsz])", name)
+    if match is None:
+        raise JSDAParseError(f"ファイル名がJSDA命名規則(YYYYMMDD[jsz])ではありません: {name}")
+    if match.group(2) != kind_char:
+        raise JSDAParseError(
+            f"ファイル種別が一致しません: {name} (期待: {kind_char})"
+        )
+    file_date = f"{match.group(1)[:4]}-{match.group(1)[4:6]}-{match.group(1)[6:]}"
+    if file_date != report_date:
+        raise JSDAParseError(
+            f"ファイル名の日付とreport_dateが一致しません: {name} != {report_date}"
+        )
+
+
+def build_weekly(
+    z_path: str | os.PathLike[str],
+    s_path: str | os.PathLike[str],
+    report_date: str,
+) -> dict[str, Any]:
+    """Build the complete ``supply_demand_weekly_v1`` JSON-compatible object."""
+    try:
+        parsed_date = date.fromisoformat(report_date)
+    except ValueError as exc:
+        raise JSDAParseError(f"report_dateがYYYY-MM-DD形式ではありません: {report_date!r}") from exc
+    if parsed_date.isoformat() != report_date:
+        raise JSDAParseError(f"report_dateがYYYY-MM-DD形式ではありません: {report_date!r}")
+
+    _validate_source_filename(z_path, "z", report_date)
+    _validate_source_filename(s_path, "s", report_date)
+    zandaka = parse_zandaka(z_path)
+    # s(新規成約高)は当該週に成約があった銘柄のみ収録される(実測: z=4,330銘柄
+    # に対しs=約3,960銘柄)。z/sの銘柄集合は一致しないのが正常で、欠けた側は
+    # 空オブジェクトのまま和集合で出力する(仕様)
+    shinki = parse_shinki(s_path)
+    issues: dict[str, dict[str, Any]] = {}
+    for code in sorted(set(zandaka) | set(shinki)):
+        z_issue = zandaka.get(code)
+        s_issue = shinki.get(code)
+        if z_issue and s_issue and z_issue["name"] != s_issue["name"]:
+            raise JSDAParseError(
+                f"z/sで銘柄名が一致しません: {code} "
+                f"({z_issue['name']!r} != {s_issue['name']!r})"
+            )
+        name = z_issue["name"] if z_issue else s_issue["name"]
+        issues[code] = {
+            "name": name,
+            "taishaku": z_issue["taishaku"] if z_issue else {},
+            "shinki": s_issue["shinki"] if s_issue else {},
+        }
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "report_date": report_date,
+        "source_files": [Path(z_path).name, Path(s_path).name],
+        "issues": issues,
+    }
+
+
+def fetch_file(url: str, dest: str | os.PathLike[str]) -> Path:
+    """Fetch one file with an explicit UA, two retries, and five-second gaps.
+
+    注意: JSDAは連続リクエストで接続を拒否する(2026-07-22実測)。複数ファイルを
+    取得する呼び出し側が、成功時にもファイル間で数秒の間隔を空ける責務を持つ。
+    """
+    destination = Path(dest)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            request = Request(url, headers={"User-Agent": USER_AGENT})
+            with urlopen(request, timeout=60) as response, temporary.open("wb") as output:
+                shutil.copyfileobj(response, output)
+            os.replace(temporary, destination)
+            return destination
+        except Exception as exc:
+            last_error = exc
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            if attempt < 2:
+                time.sleep(5)
+    raise RuntimeError(f"取得に3回失敗しました: {url}") from last_error
+
+
+def _main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="JSDA週次xlsxを正規化JSONへ変換します")
+    parser.add_argument("z_path", help="銘柄別株券等貸借週末残高 xlsx")
+    parser.add_argument("s_path", help="銘柄別株券等貸借週間新規成約高 xlsx")
+    parser.add_argument("report_date", help="報告日 (YYYY-MM-DD)")
+    args = parser.parse_args(argv)
+
+    result = build_weekly(args.z_path, args.s_path, args.report_date)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    json.dump(result, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
