@@ -398,3 +398,151 @@ class PricesRunCollectTests(unittest.TestCase):
         )
 
         self.assertEqual(result.failures, ("1105",))
+        self.assertEqual(
+            (prices_dir / "1105.json").read_text(encoding="utf-8"), sentinel
+        )
+        meta = json.loads((out / "prices_meta.json").read_text())
+        self.assertEqual(meta["price_count"], 4)
+        # retried MAX_ATTEMPTS times for the failing code's weekly request
+        weekly_calls = [c for c in opener.calls if "1105.T" in c and "1wk" in c]
+        self.assertEqual(len(weekly_calls), prices.MAX_ATTEMPTS)
+
+    def test_failure_above_threshold_raises_and_skips_meta(self):
+        # 2 failures out of 5 codes = 40%, over the 20% threshold.
+        codes = ["1101", "1102", "1103", "1104", "1105"]
+        list_path = self._write_list(codes)
+        out = self.root / "data"
+        outcomes = _ok_outcomes(codes)
+        outcomes[("1104.T", "weekly")] = [RuntimeError("boom")] * prices.MAX_ATTEMPTS
+        outcomes[("1105.T", "weekly")] = [RuntimeError("boom")] * prices.MAX_ATTEMPTS
+        opener = FakeOpener(outcomes)
+        clock = Clock()
+
+        with self.assertRaises(prices.PriceCollectorError):
+            prices.run_collect(
+                out, list_path, opener=opener, sleep=clock.sleep,
+                monotonic=clock.monotonic, generated_at=GENERATED_AT,
+            )
+
+        # The three healthy codes were still written per-code before the
+        # threshold check aborted the run (no deploy happens because the
+        # step itself now exits non-zero).
+        self.assertTrue((out / "prices" / "1101.json").exists())
+        self.assertFalse((out / "prices_meta.json").exists())
+
+    def test_never_writes_weekly_or_short_meta_files(self):
+        codes = ["1101", "1102", "1103"]
+        list_path = self._write_list(codes)
+        out = self.root / "data"
+        out.mkdir(parents=True)
+        (out / "meta.json").write_text('{"sentinel": "weekly"}', encoding="utf-8")
+        (out / "short_meta.json").write_text('{"sentinel": "short"}', encoding="utf-8")
+        opener = FakeOpener(_ok_outcomes(codes))
+        clock = Clock()
+
+        prices.run_collect(
+            out, list_path, opener=opener, sleep=clock.sleep,
+            monotonic=clock.monotonic, generated_at=GENERATED_AT,
+        )
+
+        self.assertEqual(
+            json.loads((out / "meta.json").read_text())["sentinel"], "weekly"
+        )
+        self.assertEqual(
+            json.loads((out / "short_meta.json").read_text())["sentinel"], "short"
+        )
+
+    def test_transient_failure_recovers_within_retry_budget(self):
+        codes = ["1101"]
+        list_path = self._write_list(codes)
+        out = self.root / "data"
+        outcomes = _ok_outcomes(codes)
+        outcomes[("1101.T", "daily")] = [
+            RuntimeError("temporary"),
+            outcomes[("1101.T", "daily")],
+        ]
+        opener = FakeOpener(outcomes)
+        clock = Clock()
+
+        result = prices.run_collect(
+            out, list_path, opener=opener, sleep=clock.sleep,
+            monotonic=clock.monotonic, generated_at=GENERATED_AT,
+        )
+
+        self.assertEqual(result.failures, ())
+        self.assertTrue((out / "prices" / "1101.json").exists())
+        self.assertTrue(clock.sleeps)  # backoff actually slept once
+
+    def test_empty_price_list_is_rejected(self):
+        list_path = self._write_list([])
+        with self.assertRaises(prices.PriceCollectorError):
+            prices.run_collect(self.root / "data", list_path)
+
+    def test_duplicate_code_is_rejected(self):
+        list_path = self._write_list(["1101", "1101"])
+        with self.assertRaises(prices.PriceCollectorError):
+            prices.run_collect(self.root / "data", list_path)
+
+    def test_invalid_code_shape_is_rejected(self):
+        list_path = self._write_list(["12"])
+        with self.assertRaises(prices.PriceCollectorError):
+            prices.run_collect(self.root / "data", list_path)
+
+    def test_five_digit_code_is_accepted(self):
+        # 5-digit codes are valid for preferred/class shares under repo
+        # CLAUDE.md absolute rule 2 (e.g. Itoen preferred 25935); rejecting
+        # them here would abort the whole weekly run over a single valid
+        # code addition to price_list.json.
+        codes = ["1101", "25935"]
+        list_path = self._write_list(codes)
+        out = self.root / "data"
+        opener = FakeOpener(_ok_outcomes(codes))
+        clock = Clock()
+
+        result = prices.run_collect(
+            out, list_path, opener=opener, sleep=clock.sleep,
+            monotonic=clock.monotonic, generated_at=GENERATED_AT,
+        )
+
+        self.assertEqual(result.failures, ())
+        document = json.loads((out / "prices" / "25935.json").read_text())
+        self.assertEqual(document["code"], "25935")
+
+
+class PricesCLITests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+
+    def test_main_returns_1_when_run_collect_raises(self):
+        list_path = self.root / "price_list.json"
+        list_path.write_text(json.dumps({"codes": []}), encoding="utf-8")
+        exit_code = prices._main(
+            ["--out", str(self.root / "data"), "--list", str(list_path)]
+        )
+        self.assertEqual(exit_code, 1)
+
+    def test_main_returns_0_on_success(self):
+        codes = ["1101"]
+        list_path = self.root / "price_list.json"
+        list_path.write_text(
+            json.dumps({"codes": codes}), encoding="utf-8"
+        )
+        opener = FakeOpener(_ok_outcomes(codes))
+        clock = Clock()
+        with mock.patch.object(prices.time, "sleep", clock.sleep), mock.patch.object(
+            prices.time, "monotonic", clock.monotonic
+        ), mock.patch.object(prices, "urlopen", opener):
+            exit_code = prices._main(
+                [
+                    "--out", str(self.root / "data"),
+                    "--list", str(list_path),
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertTrue((self.root / "data" / "prices" / "1101.json").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
