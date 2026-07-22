@@ -1,0 +1,122 @@
+name: Daily JPX short update
+
+on:
+  schedule:
+    - cron: '30 9 * * 1-5' # Weekdays 18:30 JST (JPX updates around 17:00 JST)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: deploy-gh-pages
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_BRANCH: gh-pages
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install openpyxl xlrd
+
+      - name: Restore previous data from gh-pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git fetch origin "${DEPLOY_BRANCH}" --depth=1; then
+            git worktree add --detach /tmp/previous-pages "origin/${DEPLOY_BRANCH}"
+            if [ -d /tmp/previous-pages/data ]; then
+              mkdir -p data
+              cp -a /tmp/previous-pages/data/. data/
+            fi
+          fi
+
+      - name: Fetch new JPX short positions
+        id: daily
+        shell: bash
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          set -euo pipefail
+          python collector/jpx_short.py --out data --cache-dir data/_cache | tee jpx-short.out
+          if grep -qx 'UPDATED=1' jpx-short.out; then
+            echo 'updated=true' >> "${GITHUB_OUTPUT}"
+          else
+            echo 'updated=false' >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Deploy one orphan commit to gh-pages
+        if: steps.daily.outputs.updated == 'true'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "${DEPLOY_BRANCH}" = 'gh-pages' || {
+            echo "Refusing force push to unexpected branch: ${DEPLOY_BRANCH}" >&2
+            exit 1
+          }
+          deploy_dir="$(mktemp -d)"
+          cp index.html sw.js manifest.json icon-192.png icon-512.png "${deploy_dir}/"
+          mkdir -p "${deploy_dir}/data"
+          rsync -a --exclude '/_cache/' data/ "${deploy_dir}/data/"
+          cd "${deploy_dir}"
+          git init --initial-branch="${DEPLOY_BRANCH}"
+          test "$(git branch --show-current)" = 'gh-pages' || {
+            echo "Initialized branch is not gh-pages" >&2
+            exit 1
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m "deploy: daily JPX short update ($(date -u +%Y-%m-%dT%H:%MZ))"
+          git push --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:${DEPLOY_BRANCH}"
+
+      - name: Notify failure via Issue
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const label = 'batch-failure';
+            const title = 'daily.yml failed: JPX空売り日次更新';
+            const body = [
+              `Run: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+              '@kojit1229'
+            ].join('\n');
+            try {
+              await github.rest.issues.getLabel({owner, repo, name: label});
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.issues.createLabel({
+                owner, repo, name: label, color: 'B60205',
+                description: 'Automated batch failure'
+              });
+            }
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', labels: label, per_page: 100
+            });
+            const existing = open.find(issue => issue.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing.number, body
+              });
+            } else {
+              await github.rest.issues.create({
+                owner, repo, title, body, labels: [label]
+              });
+            }
