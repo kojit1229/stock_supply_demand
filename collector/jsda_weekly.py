@@ -8,6 +8,7 @@ the six raw quantity/amount values defined in design.md section 4.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import re
@@ -16,7 +17,7 @@ import sys
 import time
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.request import Request, urlopen
 
 from openpyxl import load_workbook
@@ -93,6 +94,7 @@ _OUTPUT_COLUMNS = {
 _QUANTITY_COLUMNS = (3, 7, 11)
 _NUMERIC_COLUMNS = tuple(range(3, 15))
 _CHANGE_COLUMNS = (4, 6, 8, 10, 12, 14)
+_OLE_MAGIC = bytes.fromhex("D0CF11E0A1B11AE1")
 
 
 class JSDAParseError(ValueError):
@@ -144,6 +146,8 @@ def _to_int_or_none(value: Any, *, allow_none: bool, context: str) -> int | None
 
 def _row_tuple(row: tuple[Any, ...]) -> tuple[Any, ...]:
     """Return all 15 audited columns, preserving extra columns for detection."""
+    # xlrd represents empty BIFF cells as "" while openpyxl returns None.
+    row = tuple(None if value == "" else value for value in row)
     if len(row) >= 15:
         return tuple(row)
     return tuple(row) + (None,) * (15 - len(row))
@@ -159,18 +163,78 @@ def _validate_header(row_number: int, row: tuple[Any, ...], kind: str) -> None:
         )
 
 
-def _parse_workbook(path: str | os.PathLike[str], kind: str) -> dict[str, dict[str, Any]]:
+def _workbook_format(path: str | os.PathLike[str]) -> str:
+    """Return the Excel engine selected from an audited extension and magic bytes."""
     workbook_path = Path(path)
+    if workbook_path.suffix.lower() not in {".xls", ".xlsx"}:
+        raise JSDAParseError(f"Excel拡張子が.xls/.xlsxではありません: {workbook_path}")
     try:
-        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
-    except Exception as exc:
-        raise JSDAParseError(f"xlsxを開けません: {workbook_path}") from exc
+        with workbook_path.open("rb") as source:
+            magic = source.read(8)
+    except OSError as exc:
+        raise JSDAParseError(f"Excelファイルを読めません: {workbook_path}") from exc
+    if magic.startswith(b"PK"):
+        return "openpyxl"
+    if magic == _OLE_MAGIC:
+        return "xlrd"
+    raise JSDAParseError(
+        f"ExcelマジックバイトがPK/OLEではありません: {workbook_path} ({magic.hex()})"
+    )
 
+
+@contextmanager
+def _workbook_rows(
+    path: str | os.PathLike[str], kind: str
+) -> Iterator[Iterator[tuple[Any, ...]]]:
+    """Yield audited sheet rows from either OOXML or BIFF8 without duplicating parsing."""
+    workbook_path = Path(path)
+    engine = _workbook_format(workbook_path)
     sheet_name = _SHEETS[kind]
+    if engine == "openpyxl":
+        source = None
+        workbook = None
+        try:
+            source = workbook_path.open("rb")
+            workbook = load_workbook(source, read_only=True, data_only=True)
+            if sheet_name not in workbook.sheetnames:
+                raise JSDAParseError(f"対象シートがありません: {sheet_name}")
+            yield workbook[sheet_name].iter_rows(values_only=True)
+        except JSDAParseError:
+            raise
+        except Exception as exc:
+            raise JSDAParseError(f"xlsxを開けません: {workbook_path}") from exc
+        finally:
+            if workbook is not None:
+                workbook.close()
+            if source is not None:
+                source.close()
+        return
+
     try:
-        if sheet_name not in workbook.sheetnames:
+        import xlrd
+
+        workbook = xlrd.open_workbook(str(workbook_path), on_demand=True)
+    except Exception as exc:
+        raise JSDAParseError(f"xlsを開けません: {workbook_path}") from exc
+    try:
+        if sheet_name not in workbook.sheet_names():
             raise JSDAParseError(f"対象シートがありません: {sheet_name}")
-        worksheet = workbook[sheet_name]
+        worksheet = workbook.sheet_by_name(sheet_name)
+        yield (
+            tuple(worksheet.cell_value(row_index, column_index) for column_index in range(worksheet.ncols))
+            for row_index in range(worksheet.nrows)
+        )
+    finally:
+        workbook.release_resources()
+
+
+def _parse_workbook(
+    path: str | os.PathLike[str], kind: str, *, min_issue_count: int = 1
+) -> dict[str, dict[str, Any]]:
+    workbook_path = Path(path)
+    if isinstance(min_issue_count, bool) or not isinstance(min_issue_count, int) or min_issue_count < 1:
+        raise ValueError("min_issue_countは1以上の整数である必要があります")
+    with _workbook_rows(workbook_path, kind) as rows:
         issues: dict[str, dict[str, Any]] = {}
         source_names: dict[str, str] = {}
         bucket_sources: dict[tuple[str, str], set[str]] = {}
@@ -179,7 +243,7 @@ def _parse_workbook(path: str | os.PathLike[str], kind: str) -> dict[str, dict[s
         data_count = 0
         saw_total = False
 
-        for row_number, raw_row in enumerate(worksheet.iter_rows(values_only=True), 1):
+        for row_number, raw_row in enumerate(rows, 1):
             row = _row_tuple(raw_row)
             if row_number in (6, 7):
                 _validate_header(row_number, row, kind)
@@ -258,6 +322,10 @@ def _parse_workbook(path: str | os.PathLike[str], kind: str) -> dict[str, dict[s
 
         if data_count == 0:
             raise JSDAParseError("データ行が0件です")
+        if len(issues) < min_issue_count:
+            raise JSDAParseError(
+                f"銘柄数が下限未満です: {len(issues)} < {min_issue_count}"
+            )
         if total_quantities is None:
             raise JSDAParseError("合計行がありません")
         if tuple(quantity_sums) != total_quantities:
@@ -269,18 +337,20 @@ def _parse_workbook(path: str | os.PathLike[str], kind: str) -> dict[str, dict[s
             )
             raise JSDAParseError(f"数量合計が一致しません: {differences}")
         return issues
-    finally:
-        workbook.close()
 
 
-def parse_zandaka(path: str | os.PathLike[str]) -> dict[str, dict[str, Any]]:
+def parse_zandaka(
+    path: str | os.PathLike[str], *, min_issue_count: int = 1
+) -> dict[str, dict[str, Any]]:
     """Parse a JSDA weekend-balance workbook into the weekly issues shape."""
-    return _parse_workbook(path, "taishaku")
+    return _parse_workbook(path, "taishaku", min_issue_count=min_issue_count)
 
 
-def parse_shinki(path: str | os.PathLike[str]) -> dict[str, dict[str, Any]]:
+def parse_shinki(
+    path: str | os.PathLike[str], *, min_issue_count: int = 1
+) -> dict[str, dict[str, Any]]:
     """Parse a JSDA weekly-new-contract workbook into the weekly issues shape."""
-    return _parse_workbook(path, "shinki")
+    return _parse_workbook(path, "shinki", min_issue_count=min_issue_count)
 
 
 def _validate_source_filename(
@@ -347,6 +417,37 @@ def build_weekly(
         "report_date": report_date,
         "source_files": [Path(z_path).name, Path(s_path).name],
         "issues": issues,
+    }
+
+
+def build_z_weekly(
+    z_path: str | os.PathLike[str],
+    report_date: str,
+    *,
+    min_issue_count: int = 1,
+) -> dict[str, Any]:
+    """Build the weekly contract from a z workbook only (backfill v1 scope)."""
+    try:
+        parsed_date = date.fromisoformat(report_date)
+    except ValueError as exc:
+        raise JSDAParseError(f"report_dateがYYYY-MM-DD形式ではありません: {report_date!r}") from exc
+    if parsed_date.isoformat() != report_date:
+        raise JSDAParseError(f"report_dateがYYYY-MM-DD形式ではありません: {report_date!r}")
+
+    _validate_source_filename(z_path, "z", report_date)
+    zandaka = parse_zandaka(z_path, min_issue_count=min_issue_count)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "report_date": report_date,
+        "source_files": [Path(z_path).name],
+        "issues": {
+            code: {
+                "name": issue["name"],
+                "taishaku": issue["taishaku"],
+                "shinki": {},
+            }
+            for code, issue in sorted(zandaka.items())
+        },
     }
 
 
