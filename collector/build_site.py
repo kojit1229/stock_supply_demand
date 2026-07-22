@@ -235,7 +235,11 @@ def _assemble_outputs(
 
 
 def _write_outputs(out_dir: Path, outputs: dict[str, dict[str, Any]]) -> None:
-    """Replace only builder-owned outputs, preserving sibling data directories."""
+    """Replace only builder-owned outputs, preserving sibling data directories.
+
+    外部利用者あり: collector/weekly_update.py が原子的コミットのため直接呼ぶ。
+    シグネチャ・対象(issues.json/meta.json/series)を変える際は同ファイルも更新すること。
+    """
     if out_dir.exists() and not out_dir.is_dir():
         raise BuildSiteError(f"output path is not a directory: {out_dir}")
 

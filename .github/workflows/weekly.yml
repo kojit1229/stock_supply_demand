@@ -48,7 +48,7 @@ jobs:
         env:
           PYTHONUTF8: '1'
         run: |
-          set -o pipefail
+          set -euo pipefail
           python collector/weekly_update.py --out data --cache-dir data/_cache | tee weekly-update.out
           if grep -qx 'UPDATED=1' weekly-update.out; then
             echo 'updated=true' >> "${GITHUB_OUTPUT}"

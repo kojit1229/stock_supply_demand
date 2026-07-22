@@ -143,6 +143,61 @@ class WeeklyUpdateTests(unittest.TestCase):
         self.assertFalse((self.data / "weekly").exists())
         self.assertFalse((self.data / "meta.json").exists())
 
+    def test_main_prints_updated_marker_line_on_success(self):
+        # weekly.yml は `grep -qx 'UPDATED=1'` の行完全一致でdeploy可否を決める
+        self._write_meta("2026-07-03")
+        downloader = FixtureDownloader(index_for("2026-07-03", "2026-07-10"))
+        with mock.patch.object(
+            weekly_update.backfill_jsda,
+            "CachedDownloader",
+            return_value=downloader,
+        ):
+            stdout = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(io.StringIO()):
+                exit_code = weekly_update._main(
+                    ["--out", str(self.data), "--cache-dir", str(self.cache)]
+                )
+        self.assertEqual(exit_code, 0)
+        self.assertIn("UPDATED=1", stdout.getvalue().splitlines())
+
+    def test_commit_failure_rolls_back_existing_weekly_and_meta(self):
+        # 既存データがある状態で本番反映(_write_outputs)が失敗しても旧データ無傷
+        self._write_meta("2026-06-26")
+        downloader0 = FixtureDownloader(index_for("2026-07-03"))
+        weekly_update.run_weekly_update(
+            self.data, self.cache, downloader=downloader0,
+            generated_at="2026-07-15T00:00:00Z",
+        )
+        before_weekly = (self.data / "weekly" / "2026-07-03.json").read_bytes()
+        before_meta = (self.data / "meta.json").read_bytes()
+
+        downloader = FixtureDownloader(index_for("2026-07-03", "2026-07-10"))
+        real_write = weekly_update.build_site._write_outputs
+        calls = {"n": 0}
+
+        def fail_on_commit(out_dir, outputs):
+            # 1回目=stagedへの検証ビルドは通し、2回目=本番反映で失敗させる
+            calls["n"] += 1
+            if Path(out_dir) == self.data:
+                raise OSError("simulated commit failure")
+            return real_write(out_dir, outputs)
+
+        with mock.patch.object(
+            weekly_update.build_site, "_write_outputs", side_effect=fail_on_commit
+        ):
+            with self.assertRaises(OSError):
+                weekly_update.run_weekly_update(
+                    self.data, self.cache, downloader=downloader,
+                    generated_at="2026-07-22T00:00:00Z",
+                )
+
+        self.assertGreaterEqual(calls["n"], 2)
+        self.assertFalse((self.data / "weekly" / "2026-07-10.json").exists())
+        self.assertEqual(
+            (self.data / "weekly" / "2026-07-03.json").read_bytes(), before_weekly
+        )
+        self.assertEqual((self.data / "meta.json").read_bytes(), before_meta)
+
     def test_validation_failure_exits_one_without_output_files(self):
         downloader = FixtureDownloader(
             index_for("2026-07-10"), invalid_s={"20260710s.xlsx"}
