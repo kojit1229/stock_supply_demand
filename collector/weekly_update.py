@@ -148,3 +148,132 @@ def _commit_weekly_and_outputs(
         raise
 
 
+def run_weekly_update(
+    out_dir: str | os.PathLike[str],
+    cache_dir: str | os.PathLike[str],
+    *,
+    meta_path: str | os.PathLike[str] | None = None,
+    downloader: backfill_jsda.CachedDownloader | None = None,
+    generated_at: str | None = None,
+) -> WeeklyUpdateResult:
+    """Discover, validate, and atomically add all eligible complete weeks."""
+    output_root = Path(out_dir)
+    cache_root = Path(cache_dir)
+    meta = Path(meta_path) if meta_path is not None else output_root / "meta.json"
+    latest_week = _read_latest_week(meta)
+    fetcher = downloader or backfill_jsda.CachedDownloader()
+
+    index_path = fetcher.fetch(backfill_jsda.INDEX_URL, cache_root / "index.html")
+    try:
+        index_html = index_path.read_bytes().decode("utf-8", errors="replace")
+    except OSError as exc:
+        raise WeeklyUpdateError(f"JSDA indexキャッシュを読めません: {index_path}") from exc
+    discovered = backfill_jsda.discover_z_urls(index_html)
+
+    if latest_week is None:
+        target_days = sorted(discovered)[-1:]
+    else:
+        target_days = sorted(day for day in discovered if day > latest_week)
+    if not target_days:
+        return WeeklyUpdateResult((), ())
+
+    documents: list[tuple[str, dict[str, object]]] = []
+    skipped: list[str] = []
+    for report_day in target_days:
+        week = report_day.isoformat()
+        z_url = discovered[report_day]
+        z_filename = backfill_jsda.parse_z_name(
+            Path(unquote(urlsplit(z_url).path)).name
+        )
+        if z_filename is None:
+            raise WeeklyUpdateError(f"発見URLがzファイルではありません: {z_url}")
+        s_url, s_filename = _s_source(z_url)
+        z_path = fetcher.fetch(z_url, cache_root / z_filename.filename)
+        try:
+            s_path = fetcher.fetch(s_url, cache_root / s_filename)
+        except Exception as exc:
+            if _is_not_published(exc):
+                skipped.append(week)
+                print(
+                    f"weekly_update: {week} はsファイル未掲載のためスキップします",
+                    file=sys.stderr,
+                )
+                continue
+            raise WeeklyUpdateError(f"{week}のsファイル取得に失敗しました") from exc
+        document = jsda_weekly.build_weekly(z_path, s_path, week)
+        documents.append((week, document))
+
+    if not documents:
+        return WeeklyUpdateResult((), tuple(skipped))
+
+    output_root.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=".weekly-update-", dir=output_root.parent
+    ) as temporary_name:
+        stage = Path(temporary_name)
+        staged_weekly = stage / "weekly"
+        existing_weekly = output_root / "weekly"
+        if existing_weekly.is_dir():
+            shutil.copytree(existing_weekly, staged_weekly)
+        elif existing_weekly.exists():
+            raise WeeklyUpdateError(
+                f"weekly出力先がディレクトリではありません: {existing_weekly}"
+            )
+        else:
+            staged_weekly.mkdir()
+
+        weeks = []
+        for week, document in documents:
+            _write_document(staged_weekly / f"{week}.json", document)
+            weeks.append(week)
+
+        staged_output = stage / "built"
+        outputs = build_site.build_site(
+            staged_weekly, staged_output, generated_at or _generated_at()
+        )
+        _commit_weekly_and_outputs(
+            output_root,
+            staged_weekly,
+            weeks,
+            outputs,
+            stage / "rollback-weekly",
+        )
+    return WeeklyUpdateResult(tuple(weeks), tuple(skipped))
+
+
+def _main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="JSDA indexから新規週を検出して週次dataを増分更新します"
+    )
+    parser.add_argument("--out", default="data", help="出力dataディレクトリ")
+    parser.add_argument(
+        "--cache-dir", default="data/_cache", help="ダウンロードキャッシュ"
+    )
+    parser.add_argument(
+        "--meta",
+        help="latest_weekを読むmeta.json (省略時は--out配下のmeta.json)",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        result = run_weekly_update(
+            args.out, args.cache_dir, meta_path=args.meta
+        )
+    except Exception as exc:
+        print(f"weekly_update: {exc}", file=sys.stderr)
+        return 1
+
+    if result.updated:
+        print(UPDATED_MARKER)
+        print(
+            f"weekly_update: {len(result.updated_weeks)}週を更新しました "
+            f"({', '.join(result.updated_weeks)})",
+            file=sys.stderr,
+        )
+    else:
+        print("weekly_update: 対象なし")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
