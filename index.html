@@ -598,3 +598,152 @@
       }).join('');
     }
 
+    function deltaCell(current, previous) {
+      if (!isNumber(current) || !isNumber(previous)) return '<td class="missing">—</td>';
+      const delta = current - previous;
+      const className = delta > 0 ? 'delta-up' : (delta < 0 ? 'delta-down' : 'delta-flat');
+      const prefix = delta > 0 ? '+' : '';
+      return '<td class="' + className + '">' + prefix + formatNumber(delta) + '</td>';
+    }
+
+    function renderIssueData(code, weeks, issue) {
+      const target = document.getElementById('issue-content');
+      if (!target) return;
+      const latestIndex = weeks.length - 1;
+      const previousIndex = latestIndex - 1;
+      const latestWeek = latestIndex >= 0 ? weeks[latestIndex] : '—';
+      const previousWeek = previousIndex >= 0 ? weeks[previousIndex] : '—';
+      const rows = TABLE_ROWS.map(function (row) {
+        const values = Array.isArray(issue[row.key]) ? issue[row.key] : [];
+        const current = latestIndex >= 0 ? values[latestIndex] : null;
+        const previous = previousIndex >= 0 ? values[previousIndex] : null;
+        return '<tr>' +
+          '<td>' + escapeHtml(row.label) + '<span class="unit">' + escapeHtml(row.unit) + '</span></td>' +
+          '<td>' + formatNumber(current) + '</td>' +
+          '<td>' + formatNumber(previous) + '</td>' +
+          deltaCell(current, previous) +
+        '</tr>';
+      }).join('');
+
+      target.innerHTML =
+        '<section class="card" aria-labelledby="chart-title">' +
+          '<h2 id="chart-title">貸借残高の推移</h2>' +
+          '<p class="section-subtitle">週次・単位：株（欠測期間は線を接続しません）</p>' +
+          '<ul class="legend" aria-label="系列凡例">' + SERIES.map(function (series) {
+            return '<li><span class="legend-swatch" style="--swatch:' + series.color + '"></span>' + escapeHtml(series.label) + '</li>';
+          }).join('') + '</ul>' +
+          '<div class="chart-wrap"><canvas id="series-chart" role="img" aria-label="' + escapeHtml(code) + 'の貸借残高時系列チャート">時系列チャート</canvas></div>' +
+        '</section>' +
+        '<section class="card" aria-labelledby="delta-title">' +
+          '<h2 id="delta-title">最新週と前週の比較</h2>' +
+          '<div class="table-wrap"><table>' +
+            '<thead><tr><th scope="col">項目</th><th scope="col">最新<br>' + escapeHtml(latestWeek) + '</th><th scope="col">前週<br>' + escapeHtml(previousWeek) + '</th><th scope="col">前週差</th></tr></thead>' +
+            '<tbody>' + rows + '</tbody>' +
+          '</table></div>' +
+        '</section>' +
+        '<p class="note">JSDAは制度貸借を除く一般貸借。貸付残高は転貸ダブルカウントの可能性があり、借株需要の代理変数として見る</p>';
+
+      state.currentChart = { weeks: weeks, issue: issue };
+      // innerHTML代入直後でもgetBoundingClientRectが同期レイアウトを強制するため
+      // 直接描画できる。rAF待ちにすると非表示タブ(iOS PWAのバックグラウンド復帰等)で
+      // コールバックが発火せずチャートが空のままになる(2026-07-22実測)
+      drawChart(document.getElementById('series-chart'), weeks, issue);
+    }
+
+    async function renderIssuePage(code) {
+      state.currentChart = null;
+      const app = document.getElementById('app');
+      const info = state.issueByCode[code];
+      if (!info) {
+        app.innerHTML = freshnessMarkup() + '<a class="back-link" href="#/">← 銘柄検索へ</a><div class="card status-card error">銘柄「' + escapeHtml(code) + '」が見つかりません。</div>';
+        return;
+      }
+
+      app.innerHTML = freshnessMarkup() +
+        '<a class="back-link" href="#/">← 銘柄検索へ</a>' +
+        '<div class="issue-heading"><h1>' + escapeHtml(info.name) + '</h1><span class="issue-code">' + escapeHtml(code) + '</span></div>' +
+        '<div id="issue-content"><div class="card status-card">時系列データを読み込んでいます…</div></div>';
+
+      const requestId = ++state.routeRequest;
+      try {
+        const payload = await loadSeries(info.shard);
+        if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
+        const issue = payload.issues[code];
+        if (!issue) throw new Error('この銘柄の時系列データがありません。');
+        renderIssueData(code, payload.weeks, issue);
+      } catch (error) {
+        if (requestId !== state.routeRequest) return;
+        const target = document.getElementById('issue-content');
+        if (target) target.innerHTML = '<div class="card status-card error">' + escapeHtml(error.message || '時系列データを表示できません。') + '</div>';
+      }
+    }
+
+    function render() {
+      state.routeRequest += 1;
+      if (state.route.type === 'issue') renderIssuePage(state.route.code);
+      else renderSearchPage();
+    }
+
+    // EVENTS
+    function handleInput(event) {
+      if (event.target && event.target.id === 'issue-search') {
+        state.query = event.target.value;
+        patchSearchResults();
+      }
+    }
+
+    function handleRouteChange() {
+      state.route = getRoute();
+      render();
+      window.scrollTo(0, 0);
+    }
+
+    function handleResize() {
+      if (!state.currentChart || state.resizeFrame) return;
+      state.resizeFrame = window.requestAnimationFrame(function () {
+        state.resizeFrame = 0;
+        const chart = document.getElementById('series-chart');
+        if (chart && state.currentChart) drawChart(chart, state.currentChart.weeks, state.currentChart.issue);
+      });
+    }
+
+    // INIT
+    async function prepareServiceWorker() {
+      if (!('serviceWorker' in navigator)) return;
+      try {
+        await navigator.serviceWorker.register('sw.js');
+        await navigator.serviceWorker.ready;
+        if (navigator.serviceWorker.controller) return;
+        await new Promise(function (resolve) {
+          let timeoutId = 0;
+          const finish = function () {
+            navigator.serviceWorker.removeEventListener('controllerchange', finish);
+            window.clearTimeout(timeoutId);
+            resolve();
+          };
+          navigator.serviceWorker.addEventListener('controllerchange', finish);
+          timeoutId = window.setTimeout(finish, 2000);
+        });
+      } catch (error) {
+        console.warn('Service Worker registration failed:', error);
+      }
+    }
+
+    async function init() {
+      document.addEventListener('input', handleInput);
+      window.addEventListener('hashchange', handleRouteChange);
+      window.addEventListener('resize', handleResize, { passive: true });
+      state.route = getRoute();
+
+      await prepareServiceWorker();
+      await Promise.all([
+        loadMeta().catch(function (error) { state.metaError = error; }),
+        loadIssues().catch(function (error) { state.issuesError = error; })
+      ]);
+      render();
+    }
+
+    init();
+  </script>
+</body>
+</html>
