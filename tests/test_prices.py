@@ -198,3 +198,203 @@ class PricesParsingTests(unittest.TestCase):
         self.assertEqual(dates, ["2026-07-06", "2026-07-13", "2026-07-20"])
         self.assertEqual(values, [1200.0, 1250.0, 1266.0])
 
+    def test_non_adjacent_duplicate_date_is_still_rejected(self):
+        # A duplicate date that is NOT adjacent to its first occurrence (or
+        # any reversed order) must remain a genuine contract violation; only
+        # the live-quote collapse above is special-cased.
+        def jst(year, month, day):
+            return int(datetime(year, month, day, tzinfo=JST).timestamp())
+
+        timestamps = [jst(2026, 7, 6), jst(2026, 7, 13), jst(2026, 7, 6)]
+        closes = [1200.0, 1250.0, 1199.0]
+        with self.assertRaises(prices.PriceCollectorError):
+            prices.parse_chart_series(
+                _chart_payload(timestamps, closes),
+                window=prices.WEEKLY_WINDOW,
+                context="t",
+            )
+
+    def test_non_numeric_close_is_rejected(self):
+        timestamps, closes = _weekly_series(2)
+        closes[0] = "not-a-number"
+        with self.assertRaises(prices.PriceCollectorError):
+            prices.parse_chart_series(
+                _chart_payload(timestamps, closes),
+                window=prices.WEEKLY_WINDOW,
+                context="t",
+            )
+
+    def test_missing_chart_result_is_rejected(self):
+        with self.assertRaises(prices.PriceCollectorError):
+            prices.parse_chart_series(
+                {"chart": {"result": None, "error": {"code": "Not Found"}}},
+                window=prices.WEEKLY_WINDOW,
+                context="t",
+            )
+
+
+class PricesRunCollectTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+        network_guard = mock.patch.object(
+            prices,
+            "urlopen",
+            side_effect=AssertionError("tests must not access the network"),
+        )
+        network_guard.start()
+        self.addCleanup(network_guard.stop)
+
+    def _write_list(self, codes):
+        path = self.root / "price_list.json"
+        path.write_text(
+            json.dumps({"note": "test", "codes": codes}), encoding="utf-8"
+        )
+        return path
+
+    def test_all_succeed_writes_prices_and_meta(self):
+        codes = ["1101", "1102", "1103"]
+        list_path = self._write_list(codes)
+        out = self.root / "data"
+        opener = FakeOpener(_ok_outcomes(codes))
+        clock = Clock()
+
+        result = prices.run_collect(
+            out,
+            list_path,
+            opener=opener,
+            sleep=clock.sleep,
+            monotonic=clock.monotonic,
+            generated_at=GENERATED_AT,
+        )
+
+        self.assertEqual(result.total, 3)
+        self.assertEqual(result.failures, ())
+        for code in codes:
+            document = json.loads((out / "prices" / f"{code}.json").read_text())
+            self.assertEqual(document["schema_version"], 1)
+            self.assertEqual(document["code"], code)
+            self.assertEqual(
+                len(document["weekly"]["dates"]), len(document["weekly"]["close"])
+            )
+            self.assertEqual(
+                len(document["daily"]["dates"]), len(document["daily"]["close"])
+            )
+        meta = json.loads((out / "prices_meta.json").read_text())
+        self.assertEqual(meta["schema_version"], 1)
+        self.assertEqual(meta["generated_at"], GENERATED_AT)
+        self.assertEqual(meta["price_count"], 3)
+        self.assertEqual(meta["latest_price_date"], result.latest_price_date)
+
+    def test_limit_processes_only_the_leading_n_codes(self):
+        codes = ["1101", "1102", "1103", "1104"]
+        list_path = self._write_list(codes)
+        out = self.root / "data"
+        opener = FakeOpener(_ok_outcomes(codes))
+        clock = Clock()
+
+        result = prices.run_collect(
+            out, list_path, limit=2, opener=opener, sleep=clock.sleep,
+            monotonic=clock.monotonic, generated_at=GENERATED_AT,
+        )
+
+        self.assertEqual(result.total, 2)
+        self.assertTrue((out / "prices" / "1101.json").exists())
+        self.assertTrue((out / "prices" / "1102.json").exists())
+        self.assertFalse((out / "prices" / "1103.json").exists())
+
+    def test_full_run_deletes_files_for_codes_removed_from_the_list(self):
+        codes = ["1101", "1102"]
+        list_path = self._write_list(codes)
+        out = self.root / "data"
+        prices_dir = out / "prices"
+        prices_dir.mkdir(parents=True)
+        # A code that used to be in price_list.json but was removed; this
+        # file came back via weekly.yml's gh-pages restore step and would
+        # otherwise be served forever.
+        (prices_dir / "9999.json").write_text(
+            json.dumps({"schema_version": 1, "code": "9999"}), encoding="utf-8"
+        )
+        opener = FakeOpener(_ok_outcomes(codes))
+        clock = Clock()
+
+        result = prices.run_collect(
+            out, list_path, opener=opener, sleep=clock.sleep,
+            monotonic=clock.monotonic, generated_at=GENERATED_AT,
+        )
+
+        self.assertEqual(result.removed, ("9999",))
+        self.assertFalse((prices_dir / "9999.json").exists())
+        self.assertTrue((prices_dir / "1101.json").exists())
+
+    def test_limit_run_never_deletes_files_outside_the_processed_prefix(self):
+        codes = ["1101", "1102", "1103"]
+        list_path = self._write_list(codes)
+        out = self.root / "data"
+        prices_dir = out / "prices"
+        prices_dir.mkdir(parents=True)
+        (prices_dir / "9999.json").write_text(
+            json.dumps({"schema_version": 1, "code": "9999"}), encoding="utf-8"
+        )
+        opener = FakeOpener(_ok_outcomes(codes))
+        clock = Clock()
+
+        result = prices.run_collect(
+            out, list_path, limit=1, opener=opener, sleep=clock.sleep,
+            monotonic=clock.monotonic, generated_at=GENERATED_AT,
+        )
+
+        self.assertEqual(result.removed, ())
+        # 9999 is outside the --limit 1 prefix (and no longer in the full
+        # list either); a --limit run must leave it untouched regardless.
+        self.assertTrue((prices_dir / "9999.json").exists())
+
+    def test_reconcile_preserves_a_failing_codes_existing_file(self):
+        # A code that is still IN the list but failed this run must never be
+        # treated as "removed from the list" -- only codes absent from
+        # price_list.json altogether are reconciliation candidates.
+        codes = ["1101", "1102", "1103", "1104", "1105"]
+        list_path = self._write_list(codes)
+        out = self.root / "data"
+        prices_dir = out / "prices"
+        prices_dir.mkdir(parents=True)
+        sentinel = json.dumps({"schema_version": 1, "code": "1105", "sentinel": True})
+        (prices_dir / "1105.json").write_text(sentinel, encoding="utf-8")
+
+        outcomes = _ok_outcomes(codes)
+        outcomes[("1105.T", "weekly")] = [RuntimeError("boom")] * prices.MAX_ATTEMPTS
+        opener = FakeOpener(outcomes)
+        clock = Clock()
+
+        result = prices.run_collect(
+            out, list_path, opener=opener, sleep=clock.sleep,
+            monotonic=clock.monotonic, generated_at=GENERATED_AT,
+        )
+
+        self.assertEqual(result.removed, ())
+        self.assertEqual(
+            (prices_dir / "1105.json").read_text(encoding="utf-8"), sentinel
+        )
+
+    def test_failure_at_boundary_preserves_existing_file_and_still_writes_meta(self):
+        # 1 failure out of 5 codes = 20%, which must NOT exceed the threshold.
+        codes = ["1101", "1102", "1103", "1104", "1105"]
+        list_path = self._write_list(codes)
+        out = self.root / "data"
+        prices_dir = out / "prices"
+        prices_dir.mkdir(parents=True)
+        sentinel = json.dumps({"schema_version": 1, "code": "1105", "sentinel": True})
+        (prices_dir / "1105.json").write_text(sentinel, encoding="utf-8")
+
+        outcomes = _ok_outcomes(codes)
+        outcomes[("1105.T", "weekly")] = [RuntimeError("boom")] * prices.MAX_ATTEMPTS
+        opener = FakeOpener(outcomes)
+        clock = Clock()
+
+        result = prices.run_collect(
+            out, list_path, opener=opener, sleep=clock.sleep,
+            monotonic=clock.monotonic, generated_at=GENERATED_AT,
+        )
+
+        self.assertEqual(result.failures, ("1105",))
