@@ -118,3 +118,117 @@ class BackfillJSDATests(unittest.TestCase):
 
     def test_downloader_retries_with_exponential_backoff_and_user_agent(self):
         calls = []
+        sleeps = []
+        clock = [0.0]
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+
+        def fake_open(request, timeout):
+            calls.append((request, timeout))
+            if len(calls) < 3:
+                raise OSError("temporary failure")
+            return io.BytesIO(b"ok")
+
+        destination = self.root / "download.bin"
+        downloader = backfill_jsda.CachedDownloader(
+            opener=fake_open, sleep=fake_sleep, monotonic=lambda: clock[0]
+        )
+        downloader.fetch("https://example.invalid/download.bin", destination)
+
+        self.assertEqual(destination.read_bytes(), b"ok")
+        self.assertEqual(sleeps, [5.0, 10.0, 5.0])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0][1], 60)
+        self.assertEqual(
+            calls[0][0].get_header("User-agent"), jsda_weekly.USER_AGENT
+        )
+
+    def test_backfill_builds_weekly_and_shards_with_revised_source(self):
+        cache = self._cache_archive()
+        output = self.root / "data"
+        result = backfill_jsda.run_backfill(
+            date(2025, 7, 4),
+            date(2025, 10, 17),
+            output,
+            cache,
+            today=date(2026, 7, 22),
+            min_issue_count=3,
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(
+            result.processed_weeks,
+            ["2025-07-04", "2025-09-26", "2025-10-17"],
+        )
+        revised = json.loads(
+            (output / "weekly" / "2025-10-17.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            revised["source_files"], ["20251017z(20251030r).xlsx"]
+        )
+        self.assertEqual(
+            revised["issues"]["1301"]["taishaku"]["yutanpo"]["lend_qty"],
+            48_539,
+        )
+        meta = json.loads((output / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["latest_week"], "2025-10-17")
+        self.assertTrue((output / "series" / "28.json").is_file())
+
+    def test_current_half_uses_cached_index_discovery(self):
+        cache = self.root / "cache"
+        cache.mkdir()
+        (cache / "index-2026-03-20.html").write_text(
+            '<a href="files/20260319z.xlsx">holiday week</a>',
+            encoding="utf-8",
+        )
+        with ZipFile(BACKFILL_FIXTURE) as archive:
+            (cache / "20260319z.xlsx").write_bytes(
+                archive.read("20260319z.xlsx")
+            )
+
+        output = self.root / "data"
+        result = backfill_jsda.run_backfill(
+            date(2026, 3, 19),
+            date(2026, 3, 19),
+            output,
+            cache,
+            today=date(2026, 3, 20),
+            min_issue_count=3,
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.processed_weeks, ["2026-03-19"])
+        self.assertTrue((output / "weekly" / "2026-03-19.json").is_file())
+
+    def test_validation_failure_exits_one_keeps_good_week_and_skips_build(self):
+        cache = self._cache_archive()
+        output = self.root / "data"
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            exit_code = backfill_jsda._main(
+                [
+                    "--start",
+                    "2025-07-04",
+                    "--end",
+                    "2025-09-26",
+                    "--out",
+                    str(output),
+                    "--cache-dir",
+                    str(cache),
+                ]
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue((output / "weekly" / "2025-07-04.json").is_file())
+        self.assertFalse((output / "weekly" / "2025-09-26.json").exists())
+        self.assertFalse((output / "meta.json").exists())
+        message = stderr.getvalue()
+        self.assertIn("処理済み週: 2025-07-04", message)
+        self.assertIn("2025-09-26", message)
+        self.assertIn("銘柄数が下限未満", message)
+
+
+if __name__ == "__main__":
+    unittest.main()
