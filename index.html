@@ -811,6 +811,148 @@
       });
     }
 
+    // SIGNAL(需給シグナルカード。design.md §6の確定仕様。完全決定論・追加fetchなし)
+    function borrowBalanceSeries(weeks, issue) {
+      if (!issue) return weeks.map(function () { return null; });
+      const own = Array.isArray(issue.own_qty) ? issue.own_qty : [];
+      const ten = Array.isArray(issue.ten_qty) ? issue.ten_qty : [];
+      return weeks.map(function (week, index) {
+        const a = own[index];
+        const b = ten[index];
+        return (isNumber(a) && isNumber(b)) ? (a + b) : null; // nullは欠測として伝播(0扱いしない)
+      });
+    }
+
+    // 指標1: 借株残の4週変化率。有効週(非null週)が8週未満なら status:'insufficient'
+    function computeBorrowIndicator(borrow) {
+      const validCount = borrow.filter(isNumber).length;
+      if (validCount < MIN_VALID_WEEKS) {
+        return { status: 'insufficient', validCount: validCount, direction: 'neutral', changeRatio: null };
+      }
+      const latestIndex = borrow.length - 1;
+      const compareIndex = latestIndex - 4;
+      const latest = borrow[latestIndex];
+      const compare = compareIndex >= 0 ? borrow[compareIndex] : null;
+      if (!isNumber(latest) || !isNumber(compare) || compare === 0) {
+        return { status: 'unavailable', validCount: validCount, direction: 'neutral', changeRatio: null };
+      }
+      const changeRatio = (latest - compare) / compare;
+      const direction = changeRatio >= BORROW_CHANGE_THRESHOLD ? 'increase'
+        : (changeRatio <= -BORROW_CHANGE_THRESHOLD ? 'decrease' : 'neutral');
+      return { status: 'ok', validCount: validCount, direction: direction, changeRatio: changeRatio };
+    }
+
+    // 指標2: 3年内パーセンタイル。バッジ判定には使わず根拠行への併記のみ
+    function borrowPercentileLabel(borrow) {
+      const valid = borrow.filter(isNumber);
+      const latest = borrow[borrow.length - 1];
+      if (!valid.length || !isNumber(latest)) return null;
+      const total = valid.length;
+      const topPct = Math.round(valid.filter(function (v) { return v >= latest; }).length / total * 100);
+      const bottomPct = Math.round(valid.filter(function (v) { return v <= latest; }).length / total * 100);
+      if (topPct <= PERCENTILE_BAND) return '3年内の上位' + topPct + '%';
+      if (bottomPct <= PERCENTILE_BAND) return '3年内の下位' + bottomPct + '%';
+      return null;
+    }
+
+    // 各報告者の「基準日以前の最新ratio」を合計する
+    function sumLatestRatioAsOf(events, asOfDate) {
+      const bySeller = Object.create(null);
+      events.forEach(function (event) {
+        if (event.date > asOfDate) return;
+        const current = bySeller[event.seller];
+        if (!current || event.date > current.date) bySeller[event.seller] = event;
+      });
+      let sum = 0;
+      let any = false;
+      Object.keys(bySeller).forEach(function (seller) {
+        const ratio = bySeller[seller].ratio;
+        if (isNumber(ratio)) { sum += ratio; any = true; }
+      });
+      return any ? sum : null;
+    }
+
+    // 指標3: 大口空売り合計ratioの4週前比。報告が一度もなければ中立扱い。
+    // 報告はあるが4週(28日)前時点にはまだ報告が無かった(直近に報告が始まったばかり)場合は
+    // 'no-history'として区別する。events自体は存在するので根拠行で「報告なし」と誤表示しない。
+    // fetchFailed=trueの場合(shortShardのfetch自体が失敗)は'error'として区別する。
+    // 「不明(取得失敗)」と「ゼロ(報告なし)」は別状態であり、根拠行を混同して確定情報のように
+    // 表示しない(バッジ判定上はいずれもneutral扱いで変わらない)。
+    function computeShortIndicator(events, fetchFailed) {
+      if (fetchFailed) return { status: 'error', direction: 'neutral' };
+      const validEvents = (events || []).filter(function (event) {
+        return event && typeof event.date === 'string' && typeof event.seller === 'string';
+      });
+      if (!validEvents.length) return { status: 'none', direction: 'neutral' };
+      const latestDate = validEvents.reduce(function (max, event) { return event.date > max ? event.date : max; }, validEvents[0].date);
+      const priorDate = addDaysToYmd(latestDate, -28);
+      const sumLatest = sumLatestRatioAsOf(validEvents, latestDate);
+      if (!isNumber(sumLatest)) return { status: 'none', direction: 'neutral' };
+      const sumPrior = priorDate ? sumLatestRatioAsOf(validEvents, priorDate) : null;
+      if (!isNumber(sumPrior)) return { status: 'no-history', direction: 'neutral', latestDate: latestDate, sumLatest: sumLatest };
+      const deltaPt = (sumLatest - sumPrior) * 100;
+      const direction = deltaPt >= SHORT_RATIO_THRESHOLD_PT ? 'increase'
+        : (deltaPt <= -SHORT_RATIO_THRESHOLD_PT ? 'decrease' : 'neutral');
+      return { status: 'ok', direction: direction, sumLatest: sumLatest, sumPrior: sumPrior, deltaPt: deltaPt };
+    }
+
+    // バッジ4値(design.md §6): 積み上がり=橙 / 買い戻し進行=青 / 中立=灰 / データ不足=灰
+    function computeSignalBadge(borrowIndicator, shortIndicator) {
+      if (borrowIndicator.status === 'insufficient') {
+        return { key: 'insufficient', label: 'データ不足', className: 'badge-gray' };
+      }
+      const d1 = borrowIndicator.direction;
+      const d3 = shortIndicator.direction;
+      if (d1 === 'increase' && d3 === 'increase') {
+        return { key: 'pressure-up', label: '売り圧力 積み上がり', className: 'badge-orange' };
+      }
+      if ((d1 === 'decrease' && d3 === 'decrease') || (d1 === 'decrease' && d3 === 'neutral') || (d1 === 'neutral' && d3 === 'decrease')) {
+        return { key: 'covering', label: '買い戻し進行', className: 'badge-blue' };
+      }
+      return { key: 'neutral', label: '中立', className: 'badge-gray' };
+    }
+
+    function formatSignedPercent(ratio) {
+      if (!isNumber(ratio)) return '—';
+      const pct = Math.round(ratio * 1000) / 10;
+      return (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%';
+    }
+
+    function buildSignalEvidence(borrowIndicator, shortIndicator, percentileLabel) {
+      const parts = [];
+      if (borrowIndicator.status === 'ok') {
+        let part = '借株残4週' + formatSignedPercent(borrowIndicator.changeRatio);
+        if (percentileLabel) part += '（' + percentileLabel + '）';
+        parts.push(part);
+      } else {
+        parts.push('借株残4週変化: データ不足');
+      }
+      if (shortIndicator.status === 'ok') {
+        parts.push('空売り' + formatRatioPercent(shortIndicator.sumPrior) + '→' + formatRatioPercent(shortIndicator.sumLatest));
+      } else if (shortIndicator.status === 'no-history') {
+        parts.push('空売り現在' + formatRatioPercent(shortIndicator.sumLatest) + '（4週前データなし）');
+      } else if (shortIndicator.status === 'error') {
+        parts.push('空売りデータを取得できません');
+      } else {
+        parts.push('空売り報告なし');
+      }
+      return parts.join('・');
+    }
+
+    // 純関数: {weeks, issue}(series shard)とevents(shortイベント配列)から表示用データを組み立てる。
+    // computeSignal(weeks, issue, events) という名前でnode -e から直接呼べる形にしてある。
+    function computeSignal(weeks, issue, events, shortFetchFailed) {
+      const borrow = borrowBalanceSeries(weeks, issue);
+      const borrowIndicator = computeBorrowIndicator(borrow);
+      const shortIndicator = computeShortIndicator(events, shortFetchFailed);
+      const badge = computeSignalBadge(borrowIndicator, shortIndicator);
+      const percentileLabel = badge.key === 'insufficient' ? null : borrowPercentileLabel(borrow);
+      const evidence = badge.key === 'insufficient'
+        ? '有効週（借株残データがある週）が' + MIN_VALID_WEEKS + '週未満のため判定できません。'
+        : buildSignalEvidence(borrowIndicator, shortIndicator, percentileLabel);
+      return { badge: badge, evidence: evidence, borrowIndicator: borrowIndicator, shortIndicator: shortIndicator };
+    }
+
     // RENDER
     function freshnessMarkup() {
       if (state.metaError) return '<div class="freshness warning" role="status">鮮度情報を取得できません</div>';
@@ -885,7 +1027,7 @@
       return '<td class="' + className + '">' + prefix + formatNumber(delta) + '</td>';
     }
 
-    function renderIssueData(code, weeks, issue) {
+    function renderIssueData(code, weeks, issue, prices) {
       const target = document.getElementById('issue-content');
       if (!target) return;
       const latestIndex = weeks.length - 1;
@@ -904,14 +1046,32 @@
         '</tr>';
       }).join('');
 
+      const priceValues = prices ? alignPricesToWeeks(weeks, buildPriceWeekMap(prices)) : null;
+      const hasPriceValues = !!(priceValues && priceValues.some(isNumber));
+      const legendItems = SERIES.map(function (series) {
+        return '<li><span class="legend-swatch" style="--swatch:' + series.color + '"></span>' + escapeHtml(series.label) + '</li>';
+      });
+      if (hasPriceValues) {
+        legendItems.push('<li><span class="legend-swatch" style="--swatch:' + PRICE_SERIES.color + '"></span>' + escapeHtml(PRICE_SERIES.label) + '</li>');
+      }
+
+      let priceSummaryHtml = '';
+      if (prices) {
+        const latest = latestDailyPrice(prices);
+        priceSummaryHtml = '<p class="price-summary">' +
+          (latest && latest.date ? '株価 最新終値 ' + formatNumber(latest.close) + '円（' + escapeHtml(latest.date) + '）' : '株価データを読み込みました') +
+          '</p>';
+      } else {
+        priceSummaryHtml = '<p class="price-summary">株価未収録（config/price_list.jsonに追加すると収録されます）</p>';
+      }
+
       target.innerHTML =
         '<section class="card" aria-labelledby="chart-title">' +
           '<h2 id="chart-title">貸借残高の推移</h2>' +
           '<p class="section-subtitle">週次・単位：株（欠測期間は線を接続しません）</p>' +
-          '<ul class="legend" aria-label="系列凡例">' + SERIES.map(function (series) {
-            return '<li><span class="legend-swatch" style="--swatch:' + series.color + '"></span>' + escapeHtml(series.label) + '</li>';
-          }).join('') + '</ul>' +
-          '<div class="chart-wrap"><canvas id="series-chart" role="img" aria-label="' + escapeHtml(code) + 'の貸借残高時系列チャート">時系列チャート</canvas></div>' +
+          priceSummaryHtml +
+          '<ul class="legend" aria-label="系列凡例">' + legendItems.join('') + '</ul>' +
+          '<div class="chart-wrap"><canvas id="series-chart" role="img" aria-label="' + escapeHtml(code) + 'の貸借残高時系列チャート' + (hasPriceValues ? '（株価重ね描き付き）' : '') + '">時系列チャート</canvas></div>' +
         '</section>' +
         '<section class="card" aria-labelledby="delta-title">' +
           '<h2 id="delta-title">最新週と前週の比較</h2>' +
