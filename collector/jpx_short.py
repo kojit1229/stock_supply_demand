@@ -168,3 +168,173 @@ def _normalize_text(value: Any, context: str) -> str:
     return normalized
 
 
+def _normalize_name(value: Any) -> str:
+    name = _normalize_text(value, "stock name")
+    name = _NAME_SUFFIX.sub("", name).strip()
+    if not name:
+        raise JPXShortError("stock name is empty after suffix normalization")
+    return name
+
+
+def _excel_date(value: Any, datemode: int, context: str) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise JPXShortError(f"{context} is not an Excel serial date: {value!r}")
+    if not math.isfinite(float(value)):
+        raise JPXShortError(f"{context} is not a finite Excel serial date: {value!r}")
+    try:
+        import xlrd
+
+        converted = xlrd.xldate_as_datetime(value, datemode)
+    except Exception as exc:
+        raise JPXShortError(f"cannot convert {context}: {value!r}") from exc
+    if converted.time() != datetime_time.min:
+        raise JPXShortError(f"{context} contains a time component: {value!r}")
+    return converted.date().isoformat()
+
+
+def _ratio(value: Any, row_number: int) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise JPXShortError(f"row {row_number}: ratio is not numeric: {value!r}")
+    ratio = float(value)
+    if not math.isfinite(ratio) or not 0 <= ratio <= 1:
+        raise JPXShortError(f"row {row_number}: invalid ratio: {value!r}")
+    return ratio
+
+
+def _quantity(value: Any, row_number: int) -> int:
+    if isinstance(value, bool):
+        raise JPXShortError(f"row {row_number}: quantity is not an integer: {value!r}")
+    if isinstance(value, int):
+        quantity = value
+    elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        quantity = int(value)
+    else:
+        raise JPXShortError(f"row {row_number}: quantity is not an integer: {value!r}")
+    if quantity < 0:
+        raise JPXShortError(f"row {row_number}: quantity is negative: {quantity}")
+    return quantity
+
+
+def _rows_equal(actual: Iterable[Any], expected: tuple[Any, ...]) -> bool:
+    return tuple(actual) == expected
+
+
+def parse_short_workbook(
+    path: str | os.PathLike[str],
+) -> dict[str, dict[str, Any]]:
+    """Parse one audited JPX BIFF8 snapshot into short issue objects."""
+    workbook_path = Path(path)
+    publication_date = _publication_date_from_name(workbook_path.name)
+    try:
+        if _workbook_format(workbook_path) != "xlrd":
+            raise JPXShortError(f"JPX short workbook is not BIFF .xls: {workbook_path}")
+    except JPXShortError:
+        raise
+    except Exception as exc:
+        raise JPXShortError(f"cannot identify JPX workbook: {workbook_path}") from exc
+
+    try:
+        import xlrd
+
+        workbook = xlrd.open_workbook(str(workbook_path), on_demand=True)
+    except Exception as exc:
+        raise JPXShortError(f"cannot open JPX workbook: {workbook_path}") from exc
+    try:
+        if len(workbook.sheet_names()) != 1:
+            raise JPXShortError(
+                f"JPX workbook must contain exactly one sheet: {workbook.sheet_names()}"
+            )
+        worksheet = workbook.sheet_by_index(0)
+        expected_sheet = publication_date.strftime("%Y%m%d")
+        if worksheet.name != expected_sheet:
+            raise JPXShortError(
+                f"sheet name does not match publication date: "
+                f"{worksheet.name!r} != {expected_sheet!r}"
+            )
+        if worksheet.ncols != 16 or worksheet.nrows < 9:
+            raise JPXShortError(
+                f"unexpected JPX workbook dimensions: "
+                f"{worksheet.nrows} rows x {worksheet.ncols} columns"
+            )
+        if not _rows_equal(worksheet.row_values(6), _HEADER_JA):
+            raise JPXShortError("Japanese header row does not match audited format")
+        if not _rows_equal(worksheet.row_values(7), _HEADER_EN):
+            raise JPXShortError("English header row does not match audited format")
+
+        disclosure = _excel_date(
+            worksheet.cell_value(4, 2), workbook.datemode, "disclosure date"
+        )
+        if disclosure != publication_date.isoformat():
+            raise JPXShortError(
+                f"disclosure date does not match filename: "
+                f"{disclosure} != {publication_date.isoformat()}"
+            )
+
+        issues: dict[str, dict[str, Any]] = {}
+        keys: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for row_index in range(8, worksheet.nrows):
+            row = worksheet.row_values(row_index)
+            if not any(value not in ("", None) for value in row):
+                continue
+            row_number = row_index + 1
+            code = _normalize_code(row[2])
+            name = _normalize_name(row[3])
+            seller = _normalize_text(row[5], "short seller")
+            event = {
+                "date": _excel_date(
+                    row[1], workbook.datemode, f"row {row_number} calculation date"
+                ),
+                "ratio": _ratio(row[10], row_number),
+                "qty": _quantity(row[11], row_number),
+                "seller": seller,
+            }
+            issue = issues.setdefault(code, {"name": name, "events": []})
+            if issue["name"] != name:
+                raise JPXShortError(
+                    f"row {row_number}: conflicting names for {code}: "
+                    f"{issue['name']!r} != {name!r}"
+                )
+            key = (code, seller, event["date"])
+            previous = keys.get(key)
+            if previous is None:
+                keys[key] = event
+                issue["events"].append(event)
+            else:
+                # A seller can report multiple investment funds for one stock on
+                # one calculation date (observed for 402A on 2026-07-21).  The
+                # deployed event contract has no fund field, so aggregate those
+                # rows before the cross-snapshot key is applied.
+                previous["ratio"] += event["ratio"]
+                previous["qty"] += event["qty"]
+        if not issues:
+            raise JPXShortError("JPX workbook contains no data rows")
+        for issue in issues.values():
+            issue["events"].sort(key=lambda event: (event["date"], event["seller"]))
+        return issues
+    finally:
+        workbook.release_resources()
+
+
+def _validate_event(event: Any, code: str) -> dict[str, Any]:
+    if not isinstance(event, dict) or set(event) != {"date", "ratio", "qty", "seller"}:
+        raise JPXShortError(f"invalid existing event for {code}: {event!r}")
+    event_date = _parse_iso_date(event.get("date"), f"event date for {code}")
+    seller = _normalize_text(event.get("seller"), f"event seller for {code}")
+    ratio = _ratio(event.get("ratio"), 0)
+    qty = _quantity(event.get("qty"), 0)
+    return {"date": event_date, "ratio": ratio, "qty": qty, "seller": seller}
+
+
+def _load_existing_shards(short_dir: Path) -> dict[str, dict[str, Any]]:
+    if not short_dir.exists():
+        return {}
+    if not short_dir.is_dir():
+        raise JPXShortError(f"short output is not a directory: {short_dir}")
+    issues: dict[str, dict[str, Any]] = {}
+    for path in sorted(short_dir.glob("*.json")):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise JPXShortError(f"cannot read existing short shard: {path}") from exc
+        if not isinstance(document, dict) or document.get("schema_version") != SHORT_SCHEMA_VERSION:
+            raise JPXShortError(f"schema_version mismatch in existing shard: {path}")
