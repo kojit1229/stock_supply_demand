@@ -398,3 +398,203 @@
     };
 
     // DATA (fetch)
+    async function fetchJson(path) {
+      if (!/^data\/[A-Za-z0-9_./-]+\.json$/.test(path)) throw new Error('許可されていないデータパスです。');
+      const response = await fetch(path, { headers: { Accept: 'application/json' } });
+      if (!response.ok) throw new Error(path + ' の取得に失敗しました (' + response.status + ')');
+      return response.json();
+    }
+
+    async function loadMeta() {
+      const payload = await fetchJson(DATA_PATHS.meta);
+      if (!payload || typeof payload.latest_week !== 'string') throw new Error('meta.json の形式が不正です。');
+      state.meta = payload;
+    }
+
+    async function loadIssues() {
+      const payload = await fetchJson(DATA_PATHS.issues);
+      if (!payload || !payload.issues || typeof payload.issues !== 'object') throw new Error('issues.json の形式が不正です。');
+      state.issueByCode = payload.issues;
+      state.issues = Object.keys(payload.issues).map(function (code) {
+        const item = payload.issues[code] || {};
+        return {
+          code: code,
+          name: typeof item.name === 'string' ? item.name : code,
+          shard: typeof item.shard === 'string' ? item.shard : '',
+          searchText: normalizeSearch(code + ' ' + (item.name || ''))
+        };
+      });
+    }
+
+    async function loadSeries(shard) {
+      if (!/^[A-Za-z0-9_-]+$/.test(shard)) throw new Error('shard名が不正です。');
+      if (state.seriesCache.has(shard)) return state.seriesCache.get(shard);
+      const payload = await fetchJson(DATA_PATHS.series(shard));
+      if (!payload || !Array.isArray(payload.weeks) || !payload.issues || typeof payload.issues !== 'object') {
+        throw new Error('時系列データの形式が不正です。');
+      }
+      state.seriesCache.set(shard, payload);
+      return payload;
+    }
+
+    // CHART
+    function drawChart(canvas, weeks, issue) {
+      if (!canvas || !canvas.getContext) return;
+      const context = canvas.getContext('2d');
+      if (!context) return;
+
+      const cssWidth = Math.max(280, Math.floor(canvas.getBoundingClientRect().width || canvas.parentElement.clientWidth || 600));
+      const cssHeight = canvas.clientHeight || 320;
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 3);
+      canvas.width = Math.floor(cssWidth * pixelRatio);
+      canvas.height = Math.floor(cssHeight * pixelRatio);
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      context.clearRect(0, 0, cssWidth, cssHeight);
+
+      const bounds = { left: 58, right: 14, top: 14, bottom: 34 };
+      const plotWidth = Math.max(1, cssWidth - bounds.left - bounds.right);
+      const plotHeight = Math.max(1, cssHeight - bounds.top - bounds.bottom);
+      const values = [];
+      SERIES.forEach(function (series) {
+        const items = Array.isArray(issue[series.key]) ? issue[series.key] : [];
+        items.forEach(function (value) { if (isNumber(value)) values.push(value); });
+      });
+
+      if (!weeks.length || !values.length) {
+        context.fillStyle = '#9aabb9';
+        context.font = '13px -apple-system, sans-serif';
+        context.textAlign = 'center';
+        context.fillText('表示できる時系列データがありません', cssWidth / 2, cssHeight / 2);
+        return;
+      }
+
+      const maximum = Math.max.apply(null, values);
+      const yMaximum = maximum > 0 ? maximum * 1.08 : 1;
+      const xAt = function (index) {
+        return weeks.length === 1 ? bounds.left + plotWidth / 2 : bounds.left + plotWidth * index / (weeks.length - 1);
+      };
+      const yAt = function (value) { return bounds.top + plotHeight * (1 - value / yMaximum); };
+
+      context.lineWidth = 1;
+      context.font = '11px -apple-system, sans-serif';
+      context.textAlign = 'right';
+      context.textBaseline = 'middle';
+      for (let line = 0; line <= 4; line += 1) {
+        const ratio = line / 4;
+        const y = bounds.top + plotHeight * ratio;
+        context.strokeStyle = '#263545';
+        context.beginPath();
+        context.moveTo(bounds.left, y);
+        context.lineTo(cssWidth - bounds.right, y);
+        context.stroke();
+        context.fillStyle = '#8294a3';
+        context.fillText(formatCompact(yMaximum * (1 - ratio)), bounds.left - 8, y);
+      }
+
+      SERIES.forEach(function (series) {
+        const items = Array.isArray(issue[series.key]) ? issue[series.key] : [];
+        let drawing = false;
+        context.beginPath();
+        items.forEach(function (value, index) {
+          if (!isNumber(value)) {
+            drawing = false;
+            return;
+          }
+          const x = xAt(index);
+          const y = yAt(value);
+          if (drawing) context.lineTo(x, y);
+          else context.moveTo(x, y);
+          drawing = true;
+        });
+        context.strokeStyle = series.color;
+        context.lineWidth = 2;
+        context.lineJoin = 'round';
+        context.lineCap = 'round';
+        context.stroke();
+
+        if (weeks.length <= 3) {
+          items.forEach(function (value, index) {
+            if (!isNumber(value)) return;
+            context.beginPath();
+            context.arc(xAt(index), yAt(value), 3.5, 0, Math.PI * 2);
+            context.fillStyle = series.color;
+            context.fill();
+          });
+        }
+      });
+
+      const labelIndexes = weeks.length === 1 ? [0] : [0, Math.floor((weeks.length - 1) / 2), weeks.length - 1];
+      context.fillStyle = '#8294a3';
+      context.textBaseline = 'top';
+      labelIndexes.forEach(function (index, position) {
+        context.textAlign = position === 0 ? 'left' : (position === labelIndexes.length - 1 ? 'right' : 'center');
+        context.fillText(shortDate(weeks[index]), xAt(index), cssHeight - bounds.bottom + 10);
+      });
+    }
+
+    // RENDER
+    function freshnessMarkup() {
+      if (state.metaError) return '<div class="freshness warning" role="status">鮮度情報を取得できません</div>';
+      if (!state.meta) return '';
+      const days = daysSinceYmd(state.meta.latest_week);
+      if (days === null) return '<div class="freshness warning" role="status">最新週の日付形式を確認できません</div>';
+      const stale = days > 14;
+      const detail = days >= 0 ? '（' + days + '日前）' : '';
+      return '<div class="freshness' + (stale ? ' warning' : '') + '" role="status">' +
+        (stale ? '更新が遅れています：' : '最新データ：') +
+        '<time datetime="' + escapeHtml(state.meta.latest_week) + '">' + escapeHtml(state.meta.latest_week) + '</time>' + detail + '</div>';
+    }
+
+    function renderSearchPage() {
+      state.currentChart = null;
+      const app = document.getElementById('app');
+      app.innerHTML = freshnessMarkup() +
+        '<section class="search-view" aria-labelledby="search-title">' +
+          '<div class="hero">' +
+            '<p class="eyebrow">SUPPLY &amp; DEMAND</p>' +
+            '<h1 id="search-title">銘柄の需給を探す</h1>' +
+            '<p class="lead">銘柄コードまたは銘柄名から、JSDAの週次貸借残高を検索できます。</p>' +
+          '</div>' +
+          '<div class="search-box">' +
+            '<input id="issue-search" type="search" inputmode="search" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="例：285A / キオクシア" value="' + escapeHtml(state.query) + '" aria-label="銘柄コードまたは銘柄名">' +
+          '</div>' +
+          '<p id="result-summary" class="result-summary"></p>' +
+          '<ul id="result-list" class="result-list"></ul>' +
+        '</section>';
+      patchSearchResults();
+    }
+
+    function patchSearchResults() {
+      const list = document.getElementById('result-list');
+      const summary = document.getElementById('result-summary');
+      if (!list || !summary) return;
+
+      if (state.issuesError) {
+        summary.textContent = '銘柄データを取得できませんでした。再読み込みしてください。';
+        list.replaceChildren();
+        return;
+      }
+
+      const normalized = normalizeSearch(state.query);
+      if (!normalized) {
+        summary.textContent = state.issues.length ? '銘柄コードまたは銘柄名を入力してください（' + NUMBER_FORMAT.format(state.issues.length) + '銘柄）' : '銘柄データを読み込んでいます…';
+        list.replaceChildren();
+        return;
+      }
+
+      const matches = [];
+      for (let index = 0; index < state.issues.length; index += 1) {
+        const issue = state.issues[index];
+        if (issue.searchText.indexOf(normalized) !== -1) matches.push(issue);
+        if (matches.length >= RESULT_LIMIT) break;
+      }
+
+      summary.textContent = matches.length ? matches.length + (matches.length === RESULT_LIMIT ? '件以上' : '件') + '見つかりました' : '該当する銘柄がありません';
+      list.innerHTML = matches.map(function (issue) {
+        return '<li><a class="result-link" href="#/issue/' + encodeURIComponent(issue.code) + '">' +
+          '<span class="result-name">' + escapeHtml(issue.name) + '</span>' +
+          '<span class="issue-code">' + escapeHtml(issue.code) + '</span>' +
+        '</a></li>';
+      }).join('');
+    }
+
