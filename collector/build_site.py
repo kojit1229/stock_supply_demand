@@ -168,3 +168,170 @@ def _load_weekly_documents(weekly_dir: Path) -> list[dict[str, Any]]:
 
 
 def _combined_value(taishaku: dict[str, Any], field: str) -> int | None:
+    values = [
+        taishaku[collateral][field]
+        for collateral in _COLLATERAL_TYPES
+        if collateral in taishaku
+    ]
+    return sum(values) if values else None
+
+
+def _assemble_outputs(
+    documents: list[dict[str, Any]], generated_at: str
+) -> dict[str, dict[str, Any]]:
+    retained = documents[-MAX_WEEKS:]
+    weeks = [document["report_date"] for document in retained]
+
+    latest_names: dict[str, str] = {}
+    for document in retained:
+        for code, issue in document["issues"].items():
+            latest_names[code] = issue["name"]
+    if not latest_names:
+        raise BuildSiteError("empty issue set")
+
+    outputs: dict[str, dict[str, Any]] = {}
+    outputs["issues.json"] = {
+        "schema_version": ISSUES_SCHEMA_VERSION,
+        "issues": {
+            code: {"name": latest_names[code], "shard": code[:2]}
+            for code in sorted(latest_names)
+        },
+    }
+
+    shard_issues: dict[str, dict[str, Any]] = {}
+    for code in sorted(latest_names):
+        series = {field: [] for field in _SERIES_FIELDS}
+        for document in retained:
+            issue = document["issues"].get(code)
+            if issue is None:
+                for field in _SERIES_FIELDS:
+                    series[field].append(None)
+                continue
+            taishaku = issue["taishaku"]
+            for field in _SERIES_FIELDS:
+                series[field].append(_combined_value(taishaku, field))
+
+        shard = code[:2]
+        shard_issues.setdefault(shard, {})[code] = {
+            "name": latest_names[code],
+            **series,
+        }
+
+    for shard in sorted(shard_issues):
+        outputs[f"series/{shard}.json"] = {
+            "schema_version": SERIES_SCHEMA_VERSION,
+            "weeks": weeks,
+            "issues": shard_issues[shard],
+        }
+
+    outputs["meta.json"] = {
+        "schema_version": META_SCHEMA_VERSION,
+        "latest_week": weeks[-1],
+        "generated_at": generated_at,
+        "issue_count": len(latest_names),
+        "weekly_count": len(weeks),
+    }
+    return outputs
+
+
+def _write_outputs(out_dir: Path, outputs: dict[str, dict[str, Any]]) -> None:
+    """Replace only builder-owned outputs, preserving sibling data directories."""
+    if out_dir.exists() and not out_dir.is_dir():
+        raise BuildSiteError(f"output path is not a directory: {out_dir}")
+
+    rendered = {
+        relative: json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+        for relative, document in outputs.items()
+    }
+
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".build-site-", dir=out_dir.parent))
+    created_out_dir = not out_dir.exists()
+    backups: list[tuple[Path, Path]] = []
+    committed: list[Path] = []
+    try:
+        for relative, text in rendered.items():
+            staged_path = stage / "new" / relative
+            staged_path.parent.mkdir(parents=True, exist_ok=True)
+            staged_path.write_text(text, encoding="utf-8")
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        targets = ("issues.json", "meta.json", "series")
+        for name in targets:
+            target = out_dir / name
+            if target.exists() or target.is_symlink():
+                backup = stage / "old" / name
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(target, backup)
+                backups.append((backup, target))
+
+        for name in targets:
+            staged_path = stage / "new" / name
+            target = out_dir / name
+            os.replace(staged_path, target)
+            committed.append(target)
+    except Exception:
+        try:
+            for target in reversed(committed):
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                elif target.exists() or target.is_symlink():
+                    target.unlink()
+            for backup, target in reversed(backups):
+                if backup.exists() or backup.is_symlink():
+                    os.replace(backup, target)
+        except Exception as rollback_exc:
+            # 復元自体に失敗したら、旧データ(stage/old)を消さずに残して
+            # 復旧手段を保つ(この場合のみstageを削除しない)
+            raise BuildSiteError(
+                f"rollback failed; previous outputs preserved under {stage}"
+            ) from rollback_exc
+        if created_out_dir:
+            try:
+                out_dir.rmdir()
+            except OSError:
+                pass
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    else:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def build_site(
+    weekly_dir: str | os.PathLike[str],
+    out_dir: str | os.PathLike[str],
+    generated_at: str,
+) -> dict[str, dict[str, Any]]:
+    """Validate weekly snapshots and write all deployed builder outputs."""
+    _validate_generated_at(generated_at)
+    documents = _load_weekly_documents(Path(weekly_dir))
+    outputs = _assemble_outputs(documents, generated_at)
+    _write_outputs(Path(out_dir), outputs)
+    return outputs
+
+
+def _default_generated_at() -> str:
+    timestamp = datetime.fromtimestamp(time.time(), timezone.utc)
+    return timestamp.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Build JSDA issue metadata and 160-week series shards"
+    )
+    parser.add_argument("--weekly-dir", required=True, help="directory of weekly JSON files")
+    parser.add_argument("--out-dir", required=True, help="output data directory")
+    parser.add_argument("--generated-at", help="ISO 8601 generation timestamp")
+    args = parser.parse_args(argv)
+
+    generated_at = args.generated_at if args.generated_at is not None else _default_generated_at()
+    try:
+        build_site(args.weekly_dir, args.out_dir, generated_at)
+    except (BuildSiteError, OSError) as exc:
+        print(f"build_site: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
