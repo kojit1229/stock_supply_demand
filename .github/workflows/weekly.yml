@@ -5,6 +5,11 @@ on:
     - cron: '30 23 * * 1' # Tuesday 08:30 JST
     - cron: '30 23 * * 2' # Wednesday 08:30 JST retry
   workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'データ更新が無くても株価取得とデプロイを実行する(PWA変更の配信・株価初回投入用)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -57,8 +62,17 @@ jobs:
             echo 'updated=false' >> "${GITHUB_OUTPUT}"
           fi
 
+      - name: Fetch price_list.json prices
+        if: steps.weekly.outputs.updated == 'true' || inputs.force_deploy == true
+        shell: bash
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          set -euo pipefail
+          python collector/prices.py --out data --list config/price_list.json
+
       - name: Deploy one orphan commit to gh-pages
-        if: steps.weekly.outputs.updated == 'true'
+        if: steps.weekly.outputs.updated == 'true' || inputs.force_deploy == true
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
