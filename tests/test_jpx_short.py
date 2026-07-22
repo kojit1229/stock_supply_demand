@@ -3,7 +3,7 @@ import json
 import shutil
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import date
 from pathlib import Path
 from unittest import mock
@@ -239,6 +239,29 @@ class JPXShortTests(unittest.TestCase):
 
         self.assertEqual((out / "short" / "old.json").read_bytes(), b"old shard")
         self.assertEqual((out / "short_meta.json").read_bytes(), b"old meta")
+
+    def test_main_prints_updated_marker_line_on_success(self):
+        # daily.yml は `grep -qx 'UPDATED=1'` の行完全一致でdeploy可否を決める
+        out = self.root / "data"
+        cache = self.root / "cache"
+        self._seed_meta(out)
+        downloader = FixtureDownloader()
+        stdout = io.StringIO()
+        with mock.patch.object(
+            jpx_short, "CachedDownloader", return_value=downloader
+        ), redirect_stdout(stdout), redirect_stderr(io.StringIO()):
+            exit_code = jpx_short._main(
+                [
+                    "--out",
+                    str(out),
+                    "--cache-dir",
+                    str(cache),
+                    "--index-html",
+                    str(INDEX),
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertIn(jpx_short.UPDATED_MARKER, stdout.getvalue().splitlines())
 
     def test_cached_downloader_accepts_browser_user_agent_override(self):
         calls = []

@@ -36,6 +36,8 @@ JPX_USER_AGENT = (
 )
 SHORT_SCHEMA_VERSION = "supply_demand_short_v1"
 SHORT_META_SCHEMA_VERSION = "supply_demand_short_meta_v1"
+# daily.yml が `grep -qx 'UPDATED=1'` の行完全一致でdeploy可否を判定する
+UPDATED_MARKER = "UPDATED=1"
 
 _SHORT_FILENAME = re.compile(r"^(?P<day>\d{8})_Short_Positions\.xls$")
 _CODE_PATTERN = re.compile(r"[0-9A-Z]{4,5}")
@@ -567,9 +569,11 @@ def _main(argv: list[str] | None = None) -> int:
         print(f"jpx_short: {exc}", file=sys.stderr)
         return 1
     if updated:
+        print(UPDATED_MARKER)
         print(
             f"jpx_short: {len(updated)}公表日を更新しました "
-            f"({', '.join(updated)})"
+            f"({', '.join(updated)})",
+            file=sys.stderr,
         )
     else:
         print("jpx_short: 対象なし")
