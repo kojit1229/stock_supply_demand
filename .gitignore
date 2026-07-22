@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 .DS_Store
+# 生成データはmainに置かない(gh-pages専用、設計書§3)。ローカル動作確認用の生成物を除外
+/data/
