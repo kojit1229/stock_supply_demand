@@ -34,6 +34,7 @@ jobs:
       - name: Restore previous data from gh-pages
         shell: bash
         run: |
+          set -euo pipefail
           if git fetch origin "${DEPLOY_BRANCH}" --depth=1; then
             git worktree add --detach /tmp/previous-pages "origin/${DEPLOY_BRANCH}"
             if [ -d /tmp/previous-pages/data ]; then

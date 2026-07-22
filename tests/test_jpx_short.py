@@ -263,6 +263,20 @@ class JPXShortTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn(jpx_short.UPDATED_MARKER, stdout.getvalue().splitlines())
 
+    def test_main_omits_updated_marker_when_no_new_dates(self):
+        # 対象なし(=deploy不要)時にUPDATED=1が出ないことをdeployゲートの逆方向で固定
+        out = self.root / "data"
+        cache = self.root / "cache"
+        self._seed_meta(out, latest="2026-07-21")
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(io.StringIO()):
+            exit_code = jpx_short._main(
+                ["--out", str(out), "--cache-dir", str(cache), "--index-html", str(INDEX)]
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertNotIn(jpx_short.UPDATED_MARKER, stdout.getvalue().splitlines())
+        self.assertIn("対象なし", stdout.getvalue())
+
     def test_cached_downloader_accepts_browser_user_agent_override(self):
         calls = []
 
