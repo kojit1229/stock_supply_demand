@@ -22,6 +22,7 @@
       --decrease: #3fa37c;
       --series-own: #e6b85c;
       --series-ten: #73a9df;
+      --series-price: #b98af5;
       --warning: #f0b34c;
       --radius: 14px;
     }
@@ -215,8 +216,37 @@
     .legend li { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: .78rem; }
     .legend-swatch { width: 18px; height: 3px; border-radius: 2px; background: var(--swatch); }
 
+    .price-summary { color: var(--muted); font-size: .82rem; }
+
     .chart-wrap { position: relative; width: 100%; min-height: 320px; }
     #series-chart { display: block; width: 100%; height: 320px; }
+
+    .visually-hidden {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      margin: -1px;
+      padding: 0;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    .signal-card { padding: 16px clamp(16px, 4vw, 24px); }
+    .signal-badge {
+      display: inline-block;
+      padding: 5px 14px;
+      border-radius: 999px;
+      font-size: .82rem;
+      font-weight: 700;
+      letter-spacing: .02em;
+    }
+    .signal-badge.badge-orange { border: 1px solid rgba(240, 179, 76, .5); background: rgba(240, 179, 76, .14); color: #ffcf8a; }
+    .signal-badge.badge-blue { border: 1px solid rgba(115, 169, 223, .5); background: rgba(115, 169, 223, .14); color: #aed2f4; }
+    .signal-badge.badge-gray { border: 1px solid rgba(154, 171, 185, .4); background: rgba(154, 171, 185, .12); color: var(--muted); }
+    .signal-evidence { margin: 12px 0 6px; color: var(--text); font-size: .92rem; }
+    .signal-note { margin: 0; color: var(--muted); font-size: .76rem; }
 
     .table-wrap { overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
@@ -301,7 +331,8 @@
       issues: 'data/issues.json',
       series: function (shard) { return 'data/series/' + shard + '.json'; },
       short: function (shard) { return 'data/short/' + shard + '.json'; },
-      shortMeta: 'data/short_meta.json'
+      shortMeta: 'data/short_meta.json',
+      prices: function (code) { return 'data/prices/' + code + '.json'; }
     });
     const SHORT_HISTORY_LIMIT = 20;
     const SERIES = Object.freeze([
@@ -309,6 +340,7 @@
       { key: 'own_qty', label: '借入（自己）', color: '#E6B85C' },
       { key: 'ten_qty', label: '借入（転貸）', color: '#73A9DF' }
     ]);
+    const PRICE_SERIES = Object.freeze({ key: 'price', label: '株価（週次終値・右軸）', color: '#B98AF5' });
     const TABLE_ROWS = Object.freeze([
       { key: 'lend_qty', label: '貸付残高', unit: '株' },
       { key: 'own_qty', label: '借入（自己）', unit: '株' },
@@ -318,6 +350,12 @@
     const DAY_MS = 24 * 60 * 60 * 1000;
     const RESULT_LIMIT = 60;
     const NUMBER_FORMAT = new Intl.NumberFormat('ja-JP');
+
+    // SIGNAL card thresholds (design.md §6、確定仕様)
+    const BORROW_CHANGE_THRESHOLD = 0.10; // 借株残4週変化率 ±10%
+    const SHORT_RATIO_THRESHOLD_PT = 0.5; // 空売り合計ratio 4週前比 ±0.5pt
+    const MIN_VALID_WEEKS = 8; // 有効週数（借株残が非nullの週）がこれ未満なら「データ不足」
+    const PERCENTILE_BAND = 20; // 上位/下位20%
 
     function escapeHtml(value) {
       return String(value)
@@ -359,6 +397,36 @@
       return match ? Number(match[2]) + '/' + Number(match[3]) : '—';
     }
 
+    function pad2(value) {
+      return value < 10 ? '0' + value : String(value);
+    }
+
+    // "YYYY-MM-DD" を数値化してDate.UTCで扱う(new Date(文字列)は使わない)。
+    // その週(月〜日)の月曜日を"YYYY-MM-DD"で返す。JSDA週(金曜・祝日週は木曜)と
+    // 株価週足(月曜起点)を同じ週同士で対応させるためのキー。
+    function mondayKeyOf(value) {
+      const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''));
+      if (!match) return null;
+      const year = Number(match[1]);
+      const month = Number(match[2]);
+      const day = Number(match[3]);
+      const utcMs = Date.UTC(year, month - 1, day);
+      const dayOfWeek = new Date(utcMs).getUTCDay(); // 0=日 .. 6=土
+      const offsetDays = (dayOfWeek + 6) % 7; // 月曜からの経過日数
+      const monday = new Date(utcMs - offsetDays * DAY_MS);
+      return monday.getUTCFullYear() + '-' + pad2(monday.getUTCMonth() + 1) + '-' + pad2(monday.getUTCDate());
+    }
+
+    function addDaysToYmd(value, deltaDays) {
+      const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''));
+      if (!match) return null;
+      const year = Number(match[1]);
+      const month = Number(match[2]);
+      const day = Number(match[3]);
+      const shifted = new Date(Date.UTC(year, month - 1, day) + deltaDays * DAY_MS);
+      return shifted.getUTCFullYear() + '-' + pad2(shifted.getUTCMonth() + 1) + '-' + pad2(shifted.getUTCDate());
+    }
+
     function isNumber(value) {
       return typeof value === 'number' && Number.isFinite(value);
     }
@@ -396,6 +464,7 @@
       route: { type: 'search' },
       seriesCache: new Map(),
       shortCache: new Map(),
+      pricesCache: new Map(),
       shortMeta: null,
       shortMetaFetched: false,
       currentChart: null,
@@ -470,6 +539,53 @@
       return state.shortMeta;
     }
 
+    async function loadPrices(code) {
+      if (!/^[A-Za-z0-9]+$/.test(code)) throw new Error('銘柄コードが不正です。');
+      if (state.pricesCache.has(code)) return state.pricesCache.get(code);
+      const response = await fetch(DATA_PATHS.prices(code), { headers: { Accept: 'application/json' } });
+      if (response.status === 404) {
+        state.pricesCache.set(code, null);
+        return null;
+      }
+      if (!response.ok) throw new Error('株価データの取得に失敗しました (' + response.status + ')');
+      const payload = await response.json();
+      if (!payload || !payload.weekly || typeof payload.weekly !== 'object') throw new Error('株価データの形式が不正です。');
+      state.pricesCache.set(code, payload);
+      return payload;
+    }
+
+    // JSDA週(weeks配列。金曜、祝日週は木曜)に、株価週足(月曜起点)を同じ週(月〜日)で対応させる。
+    // 対応する週の終値が無ければnull(チャートはギャップとして線を切る)。
+    function buildPriceWeekMap(prices) {
+      const map = Object.create(null);
+      const weekly = prices && prices.weekly;
+      const dates = weekly && Array.isArray(weekly.dates) ? weekly.dates : [];
+      const closes = weekly && Array.isArray(weekly.close) ? weekly.close : [];
+      dates.forEach(function (date, index) {
+        const key = mondayKeyOf(date);
+        const value = closes[index];
+        if (key && isNumber(value)) map[key] = value;
+      });
+      return map;
+    }
+
+    function alignPricesToWeeks(weeks, priceMap) {
+      return weeks.map(function (week) {
+        const key = mondayKeyOf(week);
+        const value = key ? priceMap[key] : undefined;
+        return isNumber(value) ? value : null;
+      });
+    }
+
+    function latestDailyPrice(prices) {
+      const daily = prices && prices.daily;
+      const dates = daily && Array.isArray(daily.dates) ? daily.dates : [];
+      if (!dates.length) return null;
+      const lastIndex = dates.length - 1;
+      const closes = daily && Array.isArray(daily.close) ? daily.close : [];
+      return { date: dates[lastIndex], close: closes[lastIndex] };
+    }
+
     function formatRatioPercent(value) {
       if (!isNumber(value)) return '—';
       return (Math.round(value * 10000) / 100).toFixed(2) + '%';
@@ -533,11 +649,11 @@
         '</section>';
     }
 
-    async function renderShortSection(code, requestId) {
+    async function renderShortSection(code, requestId, shardPromise) {
       const target = document.getElementById('short-content');
       if (!target) return;
       try {
-        const results = await Promise.all([loadShortShard(code.slice(0, 2)), loadShortMeta()]);
+        const results = await Promise.all([shardPromise, loadShortMeta()]);
         if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
         const shard = results[0];
         const metaLine = state.shortMeta ? '<p class="section-subtitle">最新公表日: ' + escapeHtml(state.shortMeta.latest_short_date) + '</p>' : '';
@@ -551,7 +667,7 @@
     }
 
     // CHART
-    function drawChart(canvas, weeks, issue) {
+    function drawChart(canvas, weeks, issue, priceValues) {
       if (!canvas || !canvas.getContext) return;
       const context = canvas.getContext('2d');
       if (!context) return;
@@ -564,7 +680,8 @@
       context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
       context.clearRect(0, 0, cssWidth, cssHeight);
 
-      const bounds = { left: 58, right: 14, top: 14, bottom: 34 };
+      const hasPrice = Array.isArray(priceValues) && priceValues.some(isNumber);
+      const bounds = { left: 58, right: hasPrice ? 56 : 14, top: 14, bottom: 34 };
       const plotWidth = Math.max(1, cssWidth - bounds.left - bounds.right);
       const plotHeight = Math.max(1, cssHeight - bounds.top - bounds.bottom);
       const values = [];
@@ -588,9 +705,22 @@
       };
       const yAt = function (value) { return bounds.top + plotHeight * (1 - value / yMaximum); };
 
+      // 株価用の右軸スケール(残高軸とは独立)
+      let priceMinimum = 0;
+      let priceMaximum = 1;
+      let priceYAt = null;
+      if (hasPrice) {
+        const validPrices = priceValues.filter(isNumber);
+        const rawMax = Math.max.apply(null, validPrices);
+        const rawMin = Math.min.apply(null, validPrices);
+        priceMaximum = rawMax > 0 ? rawMax * 1.05 : rawMax + 1;
+        priceMinimum = rawMin >= 0 ? rawMin * 0.95 : rawMin * 1.05;
+        if (priceMaximum <= priceMinimum) priceMaximum = priceMinimum + 1;
+        priceYAt = function (value) { return bounds.top + plotHeight * (1 - (value - priceMinimum) / (priceMaximum - priceMinimum)); };
+      }
+
       context.lineWidth = 1;
       context.font = '11px -apple-system, sans-serif';
-      context.textAlign = 'right';
       context.textBaseline = 'middle';
       for (let line = 0; line <= 4; line += 1) {
         const ratio = line / 4;
@@ -601,7 +731,12 @@
         context.lineTo(cssWidth - bounds.right, y);
         context.stroke();
         context.fillStyle = '#8294a3';
+        context.textAlign = 'right';
         context.fillText(formatCompact(yMaximum * (1 - ratio)), bounds.left - 8, y);
+        if (hasPrice) {
+          context.textAlign = 'left';
+          context.fillText(formatCompact(priceMaximum - (priceMaximum - priceMinimum) * ratio), cssWidth - bounds.right + 8, y);
+        }
       }
 
       SERIES.forEach(function (series) {
@@ -635,6 +770,37 @@
           });
         }
       });
+
+      if (hasPrice && priceYAt) {
+        let drawing = false;
+        context.beginPath();
+        priceValues.forEach(function (value, index) {
+          if (!isNumber(value)) {
+            drawing = false;
+            return;
+          }
+          const x = xAt(index);
+          const y = priceYAt(value);
+          if (drawing) context.lineTo(x, y);
+          else context.moveTo(x, y);
+          drawing = true;
+        });
+        context.strokeStyle = PRICE_SERIES.color;
+        context.lineWidth = 2;
+        context.lineJoin = 'round';
+        context.lineCap = 'round';
+        context.stroke();
+
+        if (weeks.length <= 3) {
+          priceValues.forEach(function (value, index) {
+            if (!isNumber(value)) return;
+            context.beginPath();
+            context.arc(xAt(index), priceYAt(value), 3.5, 0, Math.PI * 2);
+            context.fillStyle = PRICE_SERIES.color;
+            context.fill();
+          });
+        }
+      }
 
       const labelIndexes = weeks.length === 1 ? [0] : [0, Math.floor((weeks.length - 1) / 2), weeks.length - 1];
       context.fillStyle = '#8294a3';
