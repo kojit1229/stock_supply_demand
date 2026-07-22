@@ -1082,11 +1082,23 @@
         '</section>' +
         '<p class="note">JSDAは制度貸借を除く一般貸借。貸付残高は転貸ダブルカウントの可能性があり、借株需要の代理変数として見る</p>';
 
-      state.currentChart = { weeks: weeks, issue: issue };
+      state.currentChart = { weeks: weeks, issue: issue, priceValues: priceValues };
       // innerHTML代入直後でもgetBoundingClientRectが同期レイアウトを強制するため
       // 直接描画できる。rAF待ちにすると非表示タブ(iOS PWAのバックグラウンド復帰等)で
       // コールバックが発火せずチャートが空のままになる(2026-07-22実測)
-      drawChart(document.getElementById('series-chart'), weeks, issue);
+      drawChart(document.getElementById('series-chart'), weeks, issue, priceValues);
+    }
+
+    function renderSignalCard(target, weeks, issue, events, shortFetchFailed) {
+      if (!target) return;
+      const signal = computeSignal(weeks, issue, events, shortFetchFailed);
+      target.innerHTML =
+        '<section class="card signal-card" aria-labelledby="signal-title">' +
+          '<h2 id="signal-title" class="visually-hidden">需給シグナル</h2>' +
+          '<span class="signal-badge ' + signal.badge.className + '">' + escapeHtml(signal.badge.label) + '</span>' +
+          '<p class="signal-evidence">' + escapeHtml(signal.evidence) + '</p>' +
+          '<p class="signal-note">機械的な閾値による参考情報であり売買判断ではありません。</p>' +
+        '</section>';
     }
 
     async function renderIssuePage(code) {
@@ -1101,22 +1113,67 @@
       app.innerHTML = freshnessMarkup() +
         '<a class="back-link" href="#/">← 銘柄検索へ</a>' +
         '<div class="issue-heading"><h1>' + escapeHtml(info.name) + '</h1><span class="issue-code">' + escapeHtml(code) + '</span></div>' +
+        '<div id="signal-content"><div class="card status-card">需給シグナルを計算しています…</div></div>' +
         '<div id="issue-content"><div class="card status-card">時系列データを読み込んでいます…</div></div>' +
         '<div id="short-content"><div class="card status-card">空売り報告を読み込んでいます…</div></div>';
 
       const requestId = ++state.routeRequest;
-      renderShortSection(code, requestId);
+      const seriesPromise = loadSeries(info.shard);
+      const shortShardPromise = loadShortShard(code.slice(0, 2));
+      // 株価は(a)重ね描き専用の追加fetch。JSDA・shortの成否とは独立(404=株価未収録として扱う)
+      const pricesPromise = loadPrices(code);
+
+      renderShortSection(code, requestId, shortShardPromise);
+      renderSignalSection(code, requestId, seriesPromise, shortShardPromise);
+
       try {
-        const payload = await loadSeries(info.shard);
+        const payload = await seriesPromise;
         if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
         const issue = payload.issues[code];
         if (!issue) throw new Error('この銘柄の時系列データがありません。');
-        renderIssueData(code, payload.weeks, issue);
+        let prices = null;
+        try { prices = await pricesPromise; } catch (priceError) { prices = null; }
+        if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
+        renderIssueData(code, payload.weeks, issue, prices);
       } catch (error) {
         if (requestId !== state.routeRequest) return;
         const target = document.getElementById('issue-content');
         if (target) target.innerHTML = '<div class="card status-card error">' + escapeHtml(error.message || '時系列データを表示できません。') + '</div>';
       }
+    }
+
+    async function renderSignalSection(code, requestId, seriesPromise, shortShardPromise) {
+      const target = document.getElementById('signal-content');
+      if (!target) return;
+      let weeks = [];
+      let issue = null;
+      let events = [];
+      let shortFetchFailed = false;
+      try {
+        const payload = await seriesPromise;
+        weeks = payload.weeks;
+        issue = payload.issues[code] || null;
+      } catch (error) {
+        issue = null;
+      }
+      try {
+        const shard = await shortShardPromise;
+        const shortIssue = shard && shard.issues ? shard.issues[code] : null;
+        events = (shortIssue && Array.isArray(shortIssue.events)) ? shortIssue.events : [];
+      } catch (error) {
+        // shard自体のfetch失敗は「報告が一度もない(events=[])」とは別状態。
+        // 握りつぶさずshortFetchFailedで区別し、根拠行が「空売り報告なし」と
+        // 確定情報のように誤表示しないようにする(空売りカード側の
+        // 「空売りデータを取得できません。」表示と整合させる)。
+        events = [];
+        shortFetchFailed = true;
+      }
+      if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
+      if (!issue) {
+        target.innerHTML = '<div class="card status-card">需給シグナルを計算できません。</div>';
+        return;
+      }
+      renderSignalCard(target, weeks, issue, events, shortFetchFailed);
     }
 
     function render() {
@@ -1144,7 +1201,7 @@
       state.resizeFrame = window.requestAnimationFrame(function () {
         state.resizeFrame = 0;
         const chart = document.getElementById('series-chart');
-        if (chart && state.currentChart) drawChart(chart, state.currentChart.weeks, state.currentChart.issue);
+        if (chart && state.currentChart) drawChart(chart, state.currentChart.weeks, state.currentChart.issue, state.currentChart.priceValues);
       });
     }
 
