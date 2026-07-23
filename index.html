@@ -1664,9 +1664,127 @@
       // reviewer指摘B対応: 空から作り直すのではなくseenMap(前回値)へ重ねる(mergeSeen)。
       // 一時的なfetch失敗・収録外の銘柄は前回値を保持し、基準値が消えないようにする
       saveSeen(mergeSeen(entries, seenMap));
+    }
+
+    function renderWatchPage() {
+      state.currentChart = null;
+      const app = document.getElementById('app');
+      const watchlist = loadWatchlist();
+      app.innerHTML = freshnessMarkup() +
+        '<a class="back-link" href="#/">← 銘柄検索へ</a>' +
+        '<div class="hero">' +
+          '<p class="eyebrow">WATCHLIST</p>' +
+          '<h1>ウォッチリスト（' + watchlist.codes.length + '件）</h1>' +
+          '<p class="lead">登録した銘柄の需給シグナルをまとめて確認できます。前回見たときから変化があった銘柄は先頭にまとまります。用語は<a class="guide-link-inline" href="#/guide">用語・見方ガイド</a>を確認してください。</p>' +
+          '<p class="section-subtitle">ウォッチリストはこの端末のブラウザ内にのみ保存されます（他の端末とは同期されません）。</p>' +
+        '</div>' +
+        '<div id="watch-list-content"><div class="card status-card">読み込んでいます…</div></div>';
+      const requestId = ++state.routeRequest;
+      renderWatchList(watchlist.codes, requestId);
+    }
+
+    // GUIDE PAGE(#/guide。増分9(d)。K要望「表示してもよくわからない」への回答。今回の主役)
+    function buildGuideHtml() {
+      return (
+        '<section class="card guide-section" aria-labelledby="guide-1-title">' +
+          '<h2 id="guide-1-title">1. このアプリでわかること</h2>' +
+          '<ul class="guide-list">' +
+            '<li>銘柄ごとに、機関投資家が「株を借りている量」(借株残)の推移を確認できます。</li>' +
+            '<li>発行済株式の0.5%以上の大口空売り残高が、どの機関からどれだけ報告されているかを確認できます。</li>' +
+            '<li>借株残の増減と株価の動きを重ねて見ることで、需給(買いたい人と売りたい人のバランス)の変化をつかみやすくします。</li>' +
+          '</ul>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-2-title">' +
+          '<h2 id="guide-2-title">2. 貸借取引とは</h2>' +
+          '<p>機関投資家(証券会社や運用会社など)は、値下がりしそうな株について「空売り」という取引を行うことがあります。空売りは、次のような流れで行われます。</p>' +
+          '<ul class="guide-list">' +
+            '<li>証券会社などから株を借りる</li>' +
+            '<li>借りた株を市場で売る(自分の持ち株ではなく借りた株を売るので「空」売りと呼びます)</li>' +
+            '<li>株価が下がったところで、同じ株数を買い戻す</li>' +
+            '<li>買い戻した株を貸し手に返す(ここで取引が終わります)</li>' +
+          '</ul>' +
+          '<p>売った値段より安く買い戻せれば差額が利益になり、逆に株価が上がってしまうと損失になります。「借株残(かりかぶざん)」とは、この「借りたままでまだ返していない株」の残高のことです。</p>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-3-title">' +
+          '<h2 id="guide-3-title">3. 残高(ストック)とフロー</h2>' +
+          '<p>「残高(ストック)」は、ある時点で「今どれだけ借りたままになっているか」という量です。「フロー」は、ある期間(たとえば1週間)に「新しくどれだけ動いたか」という量です。</p>' +
+          '<p>たとえるなら、残高はお風呂に溜まっているお湯の量、フローは蛇口から流れ込む水の量のようなものです。お湯の量(残高)が多くても、蛇口(フロー)が今は閉まっていることもあります。</p>' +
+          '<p>現在のシグナルカードは主に残高の変化を見ています。今後、フロー(週間の新規成約高)も別の段で表示する予定です。</p>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-4-title">' +
+          '<h2 id="guide-4-title">4. 大口空売り残高報告</h2>' +
+          '<p>発行済株式数の0.5%以上を空売りしている機関投資家は、日本取引所グループへ機関名と割合を報告し、公表される決まりになっています(0.5%ルール)。これにより、誰がどれだけ大きな空売りをしているかを確認できます。</p>' +
+          '<p>「報告なし」と表示されていても、空売りが「ゼロ」という意味ではありません。0.5%未満の空売りには公表義務がないため、単に「大口報告の基準に届いていない」だけの可能性があります。</p>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-5-title">' +
+          '<h2 id="guide-5-title">5. シグナルの計算式</h2>' +
+          '<p>バッジは、次の具体的な数字で機械的に決まります。</p>' +
+          '<ul class="guide-list">' +
+            '<li>借株残の4週間の変化率が+10%以上なら「積み上がり」方向、-10%以下なら「解消」方向、その間は「横ばい」</li>' +
+            '<li>大口空売りの割合合計の4週間の変化が+0.5ポイント以上なら「増加」、-0.5ポイント以下なら「減少」、その間は「横ばい」</li>' +
+            '<li>借株残のデータが8週分に満たない銘柄は「データ不足」</li>' +
+            '<li>両方とも積み上がり方向なら「売り圧力 積み上がり」、両方とも解消方向(片方だけ解消でもう片方が横ばいの場合を含む)なら「買い戻し進行」、それ以外は「中立」</li>' +
+          '</ul>' +
+          '<p>なぜ4週間かというと、1週間だけの動きでは日々のブレ(ノイズ)を拾いやすいため、1か月程度の期間で見ることで一時的な増減と本当の傾向を区別しやすくしています。±10%という基準も、小さな変動をすべて「変化あり」とすると情報が多すぎて逆に読みにくくなるため、目立った動きだけを拾うための機械的な目安として設定したものです。</p>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-6-title">' +
+          '<h2 id="guide-6-title">6. 株価との照らし合わせの読み方</h2>' +
+          '<p>9パターンの組み合わせがありますが、要点は次の3行にまとめられます。</p>' +
+          '<ul class="guide-list">' +
+            '<li>株価上昇+借株残の積み増し=綱引き(買い方と売り方が押し合っている状態)</li>' +
+            '<li>株価上昇+借株残の手仕舞い=追い風(上昇を後押しする組み合わせ)</li>' +
+            '<li>株価下落+借株残の積み増し=向かい風(売り圧力が強い組み合わせ)</li>' +
+          '</ul>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-7-title">' +
+          '<h2 id="guide-7-title">7. このデータの限界</h2>' +
+          '<ul class="guide-list">' +
+            '<li>JSDAが集計しているのは「一般貸借」という枠組みのみで、証券会社同士が個別に行う空売り関連の取引は含まれていません。実際の空売りの全量を表しているわけではありません。</li>' +
+            '<li>「転貸」(又貸し)の分は、集計上二重に数えられている可能性があります。残高の絶対値そのものよりも、増えているか減っているかの方向を見るのが実用的な使い方です。</li>' +
+            '<li>発行済株式の0.5%未満の空売りは公表義務がないため、このアプリには表示されません。</li>' +
+            '<li>株価データは、すべての銘柄ではなく、あらかじめ登録された約230銘柄のみに対応しています。</li>' +
+          '</ul>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-8-title">' +
+          '<h2 id="guide-8-title">8. 用語集</h2>' +
+          '<div class="table-wrap"><table class="glossary-table">' +
+            '<thead><tr><th scope="col">用語</th><th scope="col">意味</th></tr></thead>' +
+            '<tbody>' +
+              '<tr><td>大口空売り</td><td>発行済株式数の0.5%以上の空売りポジションのこと。公表義務があります。</td></tr>' +
+              '<tr><td>貸株(かしかぶ)</td><td>証券会社などが株を貸し出すこと。空売りをする人に株を貸す側の行為です。</td></tr>' +
+              '<tr><td>借株残(かりかぶざん)</td><td>借りたまま返していない株の残高。このアプリの需給シグナルの主な材料です。</td></tr>' +
+              '<tr><td>逆日歩(ぎゃくひぶ)</td><td>品貸料とも呼ばれる、株を借りるための追加コストのこと。借りたい人が多く株が不足すると発生します。</td></tr>' +
+              '<tr><td>需給(じゅきゅう)</td><td>「買いたい人」と「売りたい人」のバランスのこと。需要(買い)と供給(売り)を合わせた言葉です。</td></tr>' +
+              '<tr><td>制度信用取引と一般信用取引</td><td>取引所が定めたルールに沿う「制度信用」と、証券会社が個別に条件を決める「一般信用」の2種類。このアプリのJSDAデータは制度信用を含まない「一般貸借」が対象です。</td></tr>' +
+              '<tr><td>貸借取引(たいしゃくとりひき)</td><td>株や資金を貸し借りする取引全般のこと。このアプリでは主にJSDAが集計する一般貸借を指します。</td></tr>' +
+              '<tr><td>転貸(てんたい)</td><td>借りた株をさらに他社に貸すこと(又貸し)。集計上、同じ株が二重に数えられる原因になります。</td></tr>' +
+              '<tr><td>踏み上げ(ふみあげ)</td><td>ショートスクイーズとも呼ばれます。空売りをしていた投資家が株価上昇で買い戻さざるを得なくなり、それがさらに株価上昇を加速させる現象です。</td></tr>' +
+              '<tr><td>パーセンタイル</td><td>ある値が全体の中でどのくらいの順位にあるかを示す表現。「上位20%」なら、過去のデータの中で上位20%以内に入る高い水準という意味です。</td></tr>' +
+            '</tbody>' +
+          '</table></div>' +
+        '</section>'
+      );
+    }
+
+    function renderGuidePage() {
+      state.currentChart = null;
+      const app = document.getElementById('app');
+      app.innerHTML = freshnessMarkup() +
+        '<a class="back-link" href="#/">← トップへ</a>' +
+        '<div class="hero">' +
+          '<p class="eyebrow">GUIDE</p>' +
+          '<h1>用語・見方ガイド</h1>' +
+          '<p class="lead">需給ナビの数値や用語の意味を、できるだけやさしい言葉で説明します。</p>' +
+        '</div>' +
+        buildGuideHtml() +
+        '<p class="note">このガイドは仕組みの説明であり、投資助言ではありません。売買の判断はご自身でお願いします。</p>';
+    }
+
     function render() {
       state.routeRequest += 1;
       if (state.route.type === 'issue') renderIssuePage(state.route.code);
+      else if (state.route.type === 'watch') renderWatchPage();
+      else if (state.route.type === 'guide') renderGuidePage();
       else renderSearchPage();
     }
 
