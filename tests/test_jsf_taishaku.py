@@ -198,3 +198,200 @@ class JSFTaishakuTests(unittest.TestCase):
             out,
             source=preliminary_source,
             generated_at="2026-07-23T01:00:00Z",
+            min_data_rows=SMALL_MIN_ROWS,
+        )
+        self.assertFalse(updated_second)
+
+        snapshot = json.loads((out / "taishaku" / "2026-07-22.json").read_text(encoding="utf-8"))
+        self.assertEqual(snapshot["report_type"], "確報")
+        meta = json.loads((out / "taishaku_meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["generated_at"], GENERATED_AT)  # metaは書き換わっていない
+
+    def test_preliminary_then_confirmed_overwrites(self):
+        out = self.root / "data"
+        preliminary_text = _rewrite_report_type(self.fixture_text, "速報")
+        preliminary_source = self._write_source(preliminary_text, "preliminary.csv")
+
+        updated_first = jsf_taishaku.run_update(
+            out,
+            source=preliminary_source,
+            generated_at=GENERATED_AT,
+            min_data_rows=SMALL_MIN_ROWS,
+        )
+        self.assertTrue(updated_first)
+
+        confirmed_source = self._write_source(self.fixture_text, "confirmed.csv")
+        updated_second = jsf_taishaku.run_update(
+            out,
+            source=confirmed_source,
+            generated_at="2026-07-23T01:00:00Z",
+            min_data_rows=SMALL_MIN_ROWS,
+        )
+        self.assertTrue(updated_second)
+
+        snapshot = json.loads((out / "taishaku" / "2026-07-22.json").read_text(encoding="utf-8"))
+        self.assertEqual(snapshot["report_type"], "確報")
+        meta = json.loads((out / "taishaku_meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["generated_at"], "2026-07-23T01:00:00Z")
+        self.assertEqual(meta["latest_apply_date"], "2026-07-22")
+        self.assertEqual(meta["snapshot_count"], 1)
+
+    def test_writes_only_taishaku_contract_and_preserves_other_writers_outputs(self):
+        out = self.root / "data"
+        for relative, content in _OTHER_WRITERS_SENTINELS.items():
+            path = out / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+
+        source = self._write_source(self.fixture_text)
+        updated = jsf_taishaku.run_update(
+            out, source=source, generated_at=GENERATED_AT, min_data_rows=SMALL_MIN_ROWS
+        )
+        self.assertTrue(updated)
+
+        for relative, content in _OTHER_WRITERS_SENTINELS.items():
+            self.assertEqual((out / relative).read_bytes(), content)
+        self.assertTrue((out / "taishaku" / "2026-07-22.json").is_file())
+        self.assertTrue((out / "taishaku_meta.json").is_file())
+
+    def test_atomic_write_leaves_no_tmp_files_behind(self):
+        out = self.root / "data"
+        source = self._write_source(self.fixture_text)
+        jsf_taishaku.run_update(
+            out, source=source, generated_at=GENERATED_AT, min_data_rows=SMALL_MIN_ROWS
+        )
+        leftovers = list((out / "taishaku").glob(".tmp-*")) + list(out.glob(".tmp-*"))
+        self.assertEqual(leftovers, [])
+
+    # ---- CLI / UPDATED marker --------------------------------------
+
+    def test_main_prints_updated_marker_on_write(self):
+        # CLIは--min-data-rows等の抜け道を持たないため、既定の3,000行下限を
+        # 実際に満たすCSV(非東証の水増し行を追加)でCLI経路を検証する
+        out = self.root / "data"
+        source = self._write_source(_padded_over_row_threshold(self.fixture_text))
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout):
+            exit_code = jsf_taishaku._main(["--out", str(out), "--source", str(source)])
+        self.assertEqual(exit_code, 0)
+        self.assertIn(jsf_taishaku.UPDATED_MARKER, stdout.getvalue().splitlines())
+        snapshot = json.loads((out / "taishaku" / "2026-07-22.json").read_text(encoding="utf-8"))
+        self.assertEqual(snapshot["issue_count"], 29)  # 水増し行はTokyo外なので混入しない
+
+    def test_main_omits_updated_marker_when_downgrade_is_skipped(self):
+        out = self.root / "data"
+        padded_confirmed = _padded_over_row_threshold(self.fixture_text)
+        confirmed_source = self._write_source(padded_confirmed, "confirmed.csv")
+        stdout_first = io.StringIO()
+        with mock.patch("sys.stdout", stdout_first):
+            exit_code_first = jsf_taishaku._main(
+                ["--out", str(out), "--source", str(confirmed_source)]
+            )
+        self.assertEqual(exit_code_first, 0)
+        self.assertIn(jsf_taishaku.UPDATED_MARKER, stdout_first.getvalue().splitlines())
+
+        padded_preliminary = _rewrite_report_type(padded_confirmed, "速報")
+        preliminary_source = self._write_source(padded_preliminary, "preliminary.csv")
+        stdout_second = io.StringIO()
+        with mock.patch("sys.stdout", stdout_second):
+            exit_code_second = jsf_taishaku._main(
+                ["--out", str(out), "--source", str(preliminary_source)]
+            )
+        self.assertEqual(exit_code_second, 0)
+        self.assertNotIn(jsf_taishaku.UPDATED_MARKER, stdout_second.getvalue().splitlines())
+        snapshot = json.loads((out / "taishaku" / "2026-07-22.json").read_text(encoding="utf-8"))
+        self.assertEqual(snapshot["report_type"], "確報")  # ダウングレードされていない
+
+    def test_main_header_mismatch_exits_one_without_writing_files(self):
+        reader = csv.reader(io.StringIO(self.fixture_text))
+        rows = list(reader)
+        rows[0][0] = "不正な列名"
+        out_buf = io.StringIO()
+        writer = csv.writer(out_buf, lineterminator="\r\n")
+        writer.writerows(rows)
+        broken_source = self._write_source(out_buf.getvalue(), "broken.csv")
+
+        out = self.root / "data"
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            exit_code = jsf_taishaku._main(
+                ["--out", str(out), "--source", str(broken_source)]
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("ヘッダ", stderr.getvalue())
+        self.assertFalse((out / "taishaku").exists())
+        self.assertFalse((out / "taishaku_meta.json").exists())
+
+    # ---- network fetch (opener injected, never hits the real network) --
+
+    def test_fetch_retries_then_succeeds_with_browser_user_agent(self):
+        calls = []
+        attempts = {"count": 0}
+
+        class _FakeResponse:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *exc_info):
+                return False
+
+            def read(self_inner):
+                return "ok".encode("cp932")
+
+        def opener(request, timeout):
+            calls.append((request, timeout))
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise OSError("simulated network failure")
+            return _FakeResponse()
+
+        sleeps = []
+        text = jsf_taishaku.read_source_text(
+            None,
+            opener=opener,
+            sleep=lambda seconds: sleeps.append(seconds),
+        )
+
+        self.assertEqual(text, "ok")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0][0].get_header("User-agent"), jsf_taishaku.USER_AGENT)
+        self.assertEqual(calls[0][1], jsf_taishaku.DEFAULT_TIMEOUT)
+        self.assertEqual(sleeps, [jsf_taishaku.RETRY_BACKOFF_SECONDS] * 2)
+
+    def test_fetch_raises_taishaku_error_after_exhausting_retries(self):
+        def always_fails(request, timeout):
+            raise OSError("simulated network failure")
+
+        with self.assertRaises(jsf_taishaku.TaishakuError):
+            jsf_taishaku.read_source_text(
+                None, opener=always_fails, sleep=lambda _seconds: None
+            )
+
+    def test_network_guard_actually_intercepts_default_opener_resolution(self):
+        # B-1回帰防止: opener/sourceを指定しない呼び出しは、setUpのnetwork_guardが
+        # 差し替えたjsf_taishaku.urlopenへ実際に到達しなければならない。opener引数が
+        # 定義時のデフォルト値でurlopenを実体束縛していると、このガードは素通りされ
+        # 本番のネットワークへ抜けてしまう(reviewer B-1指摘、実機で本番GET通過を確認
+        # 済み)。sleepだけ無害化し、TaishakuErrorの__cause__がguardのAssertionError
+        # であることまで確認することで、実際にurlopen経由でガードへ到達したことを検証する
+        with self.assertRaises(jsf_taishaku.TaishakuError) as ctx:
+            jsf_taishaku._fetch_csv_bytes(sleep=lambda _seconds: None)
+        self.assertIsInstance(ctx.exception.__cause__, AssertionError)
+        self.assertIn("must not access the network", str(ctx.exception.__cause__))
+
+        with self.assertRaises(jsf_taishaku.TaishakuError) as ctx2:
+            jsf_taishaku.read_source_text(None, sleep=lambda _seconds: None)
+        self.assertIsInstance(ctx2.exception.__cause__, AssertionError)
+
+        with self.assertRaises(jsf_taishaku.TaishakuError) as ctx3:
+            jsf_taishaku.run_update(
+                self.root / "data",
+                generated_at=GENERATED_AT,
+                sleep=lambda _seconds: None,
+            )
+        self.assertIsInstance(ctx3.exception.__cause__, AssertionError)
+
+
+if __name__ == "__main__":
+    unittest.main()
