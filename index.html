@@ -1514,6 +1514,156 @@
       renderSignalCard(target, weeks, issue, events, shortFetchFailed, prices);
     }
 
+    // WATCH PAGE(#/watch。増分9(a)(b))
+    function shortLatestDateOf(events) {
+      if (!events.length) return null;
+      return events.reduce(function (max, event) {
+        return (event && typeof event.date === 'string' && event.date > max) ? event.date : max;
+      }, events[0].date);
+    }
+
+    // 1銘柄分のウォッチカード用データを組み立てる(既存のloadSeries/loadShortShard/loadPricesを再利用。
+    // shard/code単位でキャッシュされるため、銘柄ページと同じ銘柄を後で開いても再フェッチしない)
+    async function computeWatchEntry(code) {
+      const info = state.issueByCode[code];
+      if (!info) return { code: code, retired: true };
+      let weeks = [];
+      let issue = null;
+      let events = [];
+      let shortFetchFailed = false;
+      let prices = null;
+      try {
+        const payload = await loadSeries(info.shard);
+        weeks = payload.weeks;
+        issue = payload.issues[code] || null;
+      } catch (error) {
+        issue = null;
+      }
+      try {
+        const shard = await loadShortShard(code.slice(0, 2));
+        const shortIssue = shard && shard.issues ? shard.issues[code] : null;
+        events = (shortIssue && Array.isArray(shortIssue.events)) ? shortIssue.events : [];
+      } catch (error) {
+        events = [];
+        shortFetchFailed = true;
+      }
+      try { prices = await loadPrices(code); } catch (error) { prices = null; }
+      if (!issue) return { code: code, retired: false, error: true, name: info.name };
+      const signal = computeSignal(weeks, issue, events, shortFetchFailed, prices);
+      return {
+        code: code,
+        retired: false,
+        error: false,
+        name: info.name,
+        signal: signal,
+        latestWeek: weeks.length ? weeks[weeks.length - 1] : null,
+        shortLatestDate: shortLatestDateOf(events),
+        hasPrices: !!prices
+      };
+    }
+
+    // 前回閲覧時の値(seenMap)と現在値を比べ、変化ラベルを付ける。初見(seenMapに記録がない)は
+    // 比較対象が無いため変化なし扱いとする(design指示に明記がないための推測補完。報告のD参照)
+    function computeWatchChangeLabel(entry, seenMap) {
+      if (entry.retired || entry.error) return null;
+      const previous = seenMap[entry.code];
+      if (!previous) return null;
+      const badgeKey = entry.signal.badge.key;
+      if (previous.badge_key && previous.badge_key !== badgeKey) {
+        return 'シグナル変化: ' + (BADGE_LABELS[previous.badge_key] || previous.badge_key) + '→' + entry.signal.badge.label;
+      }
+      const previousShortDate = previous.short_latest_date || null;
+      if (entry.shortLatestDate && (!previousShortDate || entry.shortLatestDate > previousShortDate)) {
+        return '新しい空売り報告';
+      }
+      // latest_weekが進んだだけ(バッジ・空売り最新日に変化なし)は変化グループに入れない
+      return null;
+    }
+
+    function watchEntryByCodeAsc(a, b) {
+      return a.entry.code < b.entry.code ? -1 : (a.entry.code > b.entry.code ? 1 : 0);
+    }
+
+    // reviewer指摘B対応: nextSeenは「今回のcodes一覧」だけのマップを作り直すが、空から作るのではなく
+    // 既存のpreviousSeenへ重ねる形にする。正常に計算できた銘柄だけ新値で上書きし、一時的な
+    // fetch失敗(error)・収録外(retired)の銘柄は前回値をそのまま持ち越す(基準値を消さない)。
+    // ウォッチリストから外れた銘柄(entriesに含まれない)は結果に含まれず、自然にseenから消える。
+    function mergeSeen(entries, previousSeen) {
+      const nextSeen = {};
+      entries.forEach(function (entry) {
+        if (!entry.retired && !entry.error) {
+          nextSeen[entry.code] = {
+            badge_key: entry.signal.badge.key,
+            latest_week: entry.latestWeek,
+            short_latest_date: entry.shortLatestDate
+          };
+        } else if (previousSeen[entry.code]) {
+          nextSeen[entry.code] = previousSeen[entry.code];
+        }
+      });
+      return nextSeen;
+    }
+
+    function renderWatchEntryHtml(diffEntry) {
+      const entry = diffEntry.entry;
+      const changeBannerHtml = diffEntry.changeLabel ? '<p class="watch-change-badge">' + escapeHtml(diffEntry.changeLabel) + '</p>' : '';
+      if (entry.retired) {
+        return '<li class="watch-item watch-item-retired">' +
+          '<div class="watch-item-head"><span class="watch-item-name">' + escapeHtml(entry.code) + '</span><span class="confidence-tag">収録外</span></div>' +
+          '<p class="watch-item-note">現在の収録データにこの銘柄コードが見つかりません(廃止・コード変更などの可能性があります)。</p>' +
+          '<button type="button" class="watch-remove-btn" data-watch-remove="' + escapeHtml(entry.code) + '">ウォッチから外す</button>' +
+        '</li>';
+      }
+      if (entry.error) {
+        return '<li class="watch-item">' +
+          '<a class="watch-item-link" href="#/issue/' + encodeURIComponent(entry.code) + '">' +
+            '<div class="watch-item-head"><span class="watch-item-name">' + escapeHtml(entry.name || entry.code) + '</span><span class="issue-code">' + escapeHtml(entry.code) + '</span></div>' +
+            '<p class="watch-item-note">データを取得できません。</p>' +
+          '</a>' +
+        '</li>';
+      }
+      const evidenceOneLiner = entry.signal.evidence || entry.signal.statusText;
+      return '<li class="watch-item">' +
+        changeBannerHtml +
+        '<a class="watch-item-link" href="#/issue/' + encodeURIComponent(entry.code) + '">' +
+          '<div class="watch-item-head"><span class="watch-item-name">' + escapeHtml(entry.name) + '</span><span class="issue-code">' + escapeHtml(entry.code) + '</span></div>' +
+          '<span class="signal-badge ' + entry.signal.badge.className + '">' + escapeHtml(entry.signal.badge.label) + '</span>' +
+          '<p class="watch-item-evidence">' + escapeHtml(evidenceOneLiner) + '</p>' +
+          confidenceTagsOnlyHtml(entry.hasPrices, entry.signal.shortIndicator.status) +
+        '</a>' +
+      '</li>';
+    }
+
+    async function renderWatchList(codes, requestId) {
+      const target = document.getElementById('watch-list-content');
+      if (!target) return;
+      // reviewer指摘C対応: 銘柄マスタ(issues.json)自体の取得が失敗している場合、state.issueByCodeが
+      // 空のためcomputeWatchEntryは全銘柄を「収録外」と誤判定してしまう。マスタ障害と収録外は別状態
+      // なので、ここで専用メッセージに差し替えて個別カードの計算自体を行わない
+      if (state.issuesError) {
+        target.innerHTML = '<div class="card status-card error">銘柄マスタを取得できません。時間をおいて再読み込みしてください。</div>';
+        return;
+      }
+      if (!codes.length) {
+        target.innerHTML = '<div class="card status-card">ウォッチリストは空です。銘柄ページの「☆ウォッチに追加」から登録できます。</div>';
+        return;
+      }
+      const entries = await Promise.all(codes.map(function (code) { return computeWatchEntry(code); }));
+      if (requestId !== state.routeRequest || state.route.type !== 'watch') return;
+      const seenMap = loadSeen();
+      const diffed = entries.map(function (entry) {
+        return { entry: entry, changeLabel: computeWatchChangeLabel(entry, seenMap) };
+      });
+      const changed = diffed.filter(function (d) { return d.changeLabel; }).sort(watchEntryByCodeAsc);
+      const unchanged = diffed.filter(function (d) { return !d.changeLabel; }).sort(watchEntryByCodeAsc);
+      const noChangeHtml = changed.length ? '' : '<p class="watch-no-change">前回から変化はありません</p>';
+      target.innerHTML = noChangeHtml + '<ul class="watch-list">' +
+        changed.concat(unchanged).map(renderWatchEntryHtml).join('') +
+        '</ul>';
+      // #/watch描画完了時点の現在値でseenを更新する(次回訪問時の比較基準)。
+      // reviewer指摘B対応: 空から作り直すのではなくseenMap(前回値)へ重ねる(mergeSeen)。
+      // 一時的なfetch失敗・収録外の銘柄は前回値を保持し、基準値が消えないようにする
+      saveSeen(mergeSeen(entries, seenMap));
     function render() {
       state.routeRequest += 1;
       if (state.route.type === 'issue') renderIssuePage(state.route.code);
@@ -1525,6 +1675,19 @@
       if (event.target && event.target.id === 'issue-search') {
         state.query = event.target.value;
         patchSearchResults();
+      }
+    }
+
+    function handleClick(event) {
+      const toggleButton = event.target.closest('[data-watch-toggle]');
+      if (toggleButton) {
+        toggleWatch(toggleButton.getAttribute('data-watch-toggle'));
+        return;
+      }
+      const removeButton = event.target.closest('[data-watch-remove]');
+      if (removeButton) {
+        removeFromWatchlist(removeButton.getAttribute('data-watch-remove'));
+        if (state.route.type === 'watch') render(); // 一覧からその場で消えるよう再描画
       }
     }
 
@@ -1567,6 +1730,7 @@
 
     async function init() {
       document.addEventListener('input', handleInput);
+      document.addEventListener('click', handleClick);
       window.addEventListener('hashchange', handleRouteChange);
       window.addEventListener('resize', handleResize, { passive: true });
       state.route = getRoute();
