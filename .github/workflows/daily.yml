@@ -56,8 +56,22 @@ jobs:
             echo 'updated=false' >> "${GITHUB_OUTPUT}"
           fi
 
+      - name: Fetch new JSF (日証金) taishaku snapshot
+        id: taishaku
+        shell: bash
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          set -euo pipefail
+          python collector/jsf_taishaku.py --out data | tee taishaku.out
+          if grep -qx 'TAISHAKU_UPDATED=1' taishaku.out; then
+            echo 'updated=true' >> "${GITHUB_OUTPUT}"
+          else
+            echo 'updated=false' >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Deploy one orphan commit to gh-pages
-        if: steps.daily.outputs.updated == 'true'
+        if: steps.daily.outputs.updated == 'true' || steps.taishaku.outputs.updated == 'true'
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
