@@ -583,6 +583,127 @@
       resizeFrame: 0
     };
 
+    // WATCHLIST(増分9。localStorageのみ・端末間同期なし・寛容パース。
+    // v2-policy.md 設計警告7: 上限件数・schema_version・廃止銘柄の扱い・同期なしを明記する契約)
+    function loadWatchlist() {
+      try {
+        const raw = localStorage.getItem(WATCHLIST_KEY);
+        if (!raw) return { schema_version: 1, codes: [] };
+        const parsed = JSON.parse(raw);
+        const codes = parsed && Array.isArray(parsed.codes)
+          ? parsed.codes.filter(function (code) { return typeof code === 'string' && code; })
+          : [];
+        return { schema_version: 1, codes: codes };
+      } catch (error) {
+        return { schema_version: 1, codes: [] };
+      }
+    }
+
+    function saveWatchlist(watchlist) {
+      try {
+        localStorage.setItem(WATCHLIST_KEY, JSON.stringify({ schema_version: 1, codes: watchlist.codes }));
+      } catch (error) {
+        // localStorageが使えない(プライベートモード・容量超過等)場合は静かに諦める。
+        // UIには反映されないが例外は投げない(表示専用アプリの方針を踏襲)
+      }
+    }
+
+    function isWatched(code) {
+      return loadWatchlist().codes.indexOf(code) !== -1;
+    }
+
+    // 追加: 重複防止・上限50件。上限超過時は{ok:false, reason:'limit'}を返す(呼び出し側でメッセージ表示)
+    function addToWatchlist(code) {
+      const watchlist = loadWatchlist();
+      if (watchlist.codes.indexOf(code) !== -1) return { ok: true, watchlist: watchlist };
+      if (watchlist.codes.length >= WATCHLIST_LIMIT) return { ok: false, reason: 'limit', watchlist: watchlist };
+      watchlist.codes.push(code);
+      saveWatchlist(watchlist);
+      return { ok: true, watchlist: watchlist };
+    }
+
+    function removeFromWatchlist(code) {
+      const watchlist = loadWatchlist();
+      const index = watchlist.codes.indexOf(code);
+      if (index === -1) return watchlist;
+      watchlist.codes.splice(index, 1);
+      saveWatchlist(watchlist);
+      return watchlist;
+    }
+
+    // 週次差分ダイジェスト用の「前回閲覧時の値」。#/watch描画完了時に現在値で上書きする
+    function loadSeen() {
+      try {
+        const raw = localStorage.getItem(SEEN_KEY);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        return (parsed && parsed.seen && typeof parsed.seen === 'object') ? parsed.seen : {};
+      } catch (error) {
+        return {};
+      }
+    }
+
+    function saveSeen(seen) {
+      try {
+        localStorage.setItem(SEEN_KEY, JSON.stringify({ schema_version: 1, seen: seen }));
+      } catch (error) {
+        // 同上、静かに諦める
+      }
+    }
+
+    // 確度ラベル(design.md増分9 (c)。銘柄ページ・watchカード共通)
+    function buildConfidenceTags(hasPrices, shortStatus) {
+      const tags = [];
+      if (!hasPrices) tags.push('株価データなし');
+      if (shortStatus === 'none') tags.push('大口空売り非開示圏(0.5%未満は公表されません)');
+      tags.push('一般貸借のみ(JSDA)');
+      return tags;
+    }
+
+    // タグ行のみ(リンクなし)。ウォッチカードのように既に外側が<a>の中はネストできないため専用に分ける
+    function confidenceTagsOnlyHtml(hasPrices, shortStatus) {
+      const tags = buildConfidenceTags(hasPrices, shortStatus);
+      return '<div class="confidence-tags">' +
+        tags.map(function (tag) { return '<span class="confidence-tag">' + escapeHtml(tag) + '</span>'; }).join('') +
+        '</div>';
+    }
+
+    // タグ+ガイドへのリンク。銘柄ページのシグナルカードなど、他に<a>を含まない文脈専用
+    // (reviewer指摘A: watch-item-link<a>の中でこれを使うとアンカーが入れ子になり、
+    // ブラウザが外側aを暗黙的に閉じてレイアウトが崩れる。watchカードではconfidenceTagsOnlyHtmlを使うこと)
+    function confidenceTagsHtml(hasPrices, shortStatus) {
+      return confidenceTagsOnlyHtml(hasPrices, shortStatus) +
+        '<a class="confidence-tags-link" href="#/guide">タグの意味を用語ガイドで見る →</a>';
+    }
+
+    // 銘柄ページのウォッチ登録ボタン(差分DOMパッチ対象。#watch-toggle-wrap の中身だけ更新する)
+    function watchButtonHtml(code) {
+      const watchlist = loadWatchlist();
+      const watched = watchlist.codes.indexOf(code) !== -1;
+      if (watched) {
+        return '<button type="button" class="watch-toggle-btn watch-toggle-btn-active" data-watch-toggle="' + escapeHtml(code) + '">★追加済み（タップで解除）</button>';
+      }
+      if (watchlist.codes.length >= WATCHLIST_LIMIT) {
+        return '<button type="button" class="watch-toggle-btn" data-watch-toggle="' + escapeHtml(code) + '" disabled>☆ウォッチに追加</button>' +
+          '<p class="watch-limit-note">上限50件です</p>';
+      }
+      return '<button type="button" class="watch-toggle-btn" data-watch-toggle="' + escapeHtml(code) + '">☆ウォッチに追加</button>';
+    }
+
+    function refreshWatchButton(code) {
+      const wrap = document.getElementById('watch-toggle-wrap');
+      if (wrap) wrap.innerHTML = watchButtonHtml(code);
+    }
+
+    function toggleWatch(code) {
+      if (isWatched(code)) {
+        removeFromWatchlist(code);
+      } else {
+        addToWatchlist(code); // 上限到達時はaddが何もせず{ok:false}を返す。ボタンは再描画で無効表示のまま
+      }
+      refreshWatchButton(code);
+    }
+
     // DATA (fetch)
     async function fetchJson(path) {
       if (!/^data\/[A-Za-z0-9_./-]+\.json$/.test(path)) throw new Error('許可されていないデータパスです。');
@@ -1162,12 +1283,14 @@
     function renderSearchPage() {
       state.currentChart = null;
       const app = document.getElementById('app');
+      const watchCount = loadWatchlist().codes.length;
       app.innerHTML = freshnessMarkup() +
+        '<a class="watch-count-link" href="#/watch">☆ ウォッチリスト（' + watchCount + '件）</a>' +
         '<section class="search-view" aria-labelledby="search-title">' +
           '<div class="hero">' +
             '<p class="eyebrow">SUPPLY &amp; DEMAND</p>' +
             '<h1 id="search-title">銘柄の需給を探す</h1>' +
-            '<p class="lead">銘柄コードまたは銘柄名から、JSDAの週次貸借残高を検索できます。</p>' +
+            '<p class="lead">銘柄コードまたは銘柄名から、JSDAの週次貸借残高を検索できます。用語が分からないときは<a class="guide-link-inline" href="#/guide">用語・見方ガイド</a>をご覧ください。</p>' +
           '</div>' +
           '<div class="search-box">' +
             '<input id="issue-search" type="search" inputmode="search" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="例：285A / キオクシア" value="' + escapeHtml(state.query) + '" aria-label="銘柄コードまたは銘柄名">' +
@@ -1297,12 +1420,14 @@
           '<p class="signal-status-text">' + escapeHtml(signal.statusText) + '</p>' +
           evidenceHtml +
           priceCompareHtml +
+          confidenceTagsHtml(!!prices, signal.shortIndicator.status) +
           '<p class="signal-note">機械的な閾値による参考情報であり売買判断ではありません。</p>' +
           '<details class="detail-note"><summary>このシグナルの見方(かんたん解説)</summary>' +
             '<p>・「借株」とは: 機関投資家が空売り(株を借りて売り、値下がり後に買い戻して返す取引)のために借りている株のことです。借株が増える=空売りの準備が進んでいる、減る=買い戻しが進んでいる、と読めます。</p>' +
             '<p>・「大口空売り」とは: 発行済株式の0.5%以上を空売りすると、機関名の公表が義務付けられています。誰がどれだけ売っているかが見えます。</p>' +
             '<p>・注意: 貸し借りの集計には又貸し分の二重計上がありえるため、残高の絶対値より「増えているか減っているか」を見るのがコツです。</p>' +
             '<p>・この判定は決まった計算式(閾値: 借株残4週±10%、空売り残高4週±0.5ポイント)による機械的な参考情報です。</p>' +
+            '<p>もっと詳しく知りたいときは<a class="guide-link-inline" href="#/guide">用語・見方ガイド</a>もご覧ください。</p>' +
           '</details>' +
         '</section>';
     }
@@ -1318,7 +1443,10 @@
 
       app.innerHTML = freshnessMarkup() +
         '<a class="back-link" href="#/">← 銘柄検索へ</a>' +
-        '<div class="issue-heading"><h1>' + escapeHtml(info.name) + '</h1><span class="issue-code">' + escapeHtml(code) + '</span></div>' +
+        '<div class="issue-heading"><h1>' + escapeHtml(info.name) + '</h1>' +
+          '<div class="issue-heading-meta"><span class="issue-code">' + escapeHtml(code) + '</span>' +
+          '<span id="watch-toggle-wrap">' + watchButtonHtml(code) + '</span></div>' +
+        '</div>' +
         '<div id="signal-content"><div class="card status-card">需給シグナルを計算しています…</div></div>' +
         '<div id="issue-content"><div class="card status-card">時系列データを読み込んでいます…</div></div>' +
         '<div id="short-content"><div class="card status-card">空売り報告を読み込んでいます…</div></div>';
