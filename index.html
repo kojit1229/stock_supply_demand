@@ -234,6 +234,26 @@
     }
 
     .signal-card { padding: 16px clamp(16px, 4vw, 24px); }
+    .signal-status-text { margin: 12px 0 0; color: var(--text); font-size: .96rem; line-height: 1.65; }
+    .signal-price-compare {
+      margin: 10px 0 0;
+      padding: 9px 12px;
+      border-left: 3px solid var(--series-price);
+      border-radius: 4px 9px 9px 4px;
+      background: rgba(185, 138, 245, .08);
+      color: #d7c4fb;
+      font-size: .86rem;
+    }
+    details.detail-note { margin-top: 14px; color: var(--muted); font-size: .8rem; }
+    details.detail-note summary {
+      cursor: pointer;
+      color: var(--text);
+      font-weight: 650;
+      font-size: .84rem;
+    }
+    details.detail-note summary::marker { color: var(--muted); }
+    details.detail-note p { margin: 8px 0 0; }
+    details.detail-note p + p { margin-top: 6px; }
     .signal-badge {
       display: inline-block;
       padding: 5px 14px;
@@ -356,6 +376,8 @@
     const SHORT_RATIO_THRESHOLD_PT = 0.5; // 空売り合計ratio 4週前比 ±0.5pt
     const MIN_VALID_WEEKS = 8; // 有効週数（借株残が非nullの週）がこれ未満なら「データ不足」
     const PERCENTILE_BAND = 20; // 上位/下位20%
+    const PRICE_CHANGE_THRESHOLD = 0.05; // 株価週足4週変化率 ±5%でup/down判定(増分5.1)
+    const PRICE_TREND_MIN_POINTS = 5; // 株価週足の非null本数がこれ未満なら株価照らし合わせ行を非表示
 
     function escapeHtml(value) {
       return String(value)
@@ -635,6 +657,7 @@
       target.innerHTML =
         '<section class="card" aria-labelledby="short-title">' +
           '<h2 id="short-title">大口空売り残高報告（0.5%以上）</h2>' + metaLine +
+          '<p class="section-subtitle">発行済株式の0.5%以上を空売りしている機関の一覧です。割合が下がってきていれば買い戻しが進んでいます。</p>' +
           '<p class="section-subtitle">報告者別の最新状況（割合は発行済株式数に対する空売り残高）</p>' +
           '<div class="table-wrap"><table>' +
             '<thead><tr><th scope="col">報告者</th><th scope="col">計算日</th><th scope="col">割合</th><th scope="col">数量（株）</th></tr></thead>' +
@@ -842,17 +865,24 @@
       return { status: 'ok', validCount: validCount, direction: direction, changeRatio: changeRatio };
     }
 
-    // 指標2: 3年内パーセンタイル。バッジ判定には使わず根拠行への併記のみ
-    function borrowPercentileLabel(borrow) {
+    // 指標2: 3年内パーセンタイル。バッジ判定には使わず根拠行の水準句(「過去3年でも多い/少ない水準」)への
+    // 反映のみに使う(増分5.1で統計用語の生数値は根拠行から落とし、水準の種別だけ返す)
+    function borrowPercentileLevel(borrow) {
       const valid = borrow.filter(isNumber);
       const latest = borrow[borrow.length - 1];
       if (!valid.length || !isNumber(latest)) return null;
       const total = valid.length;
       const topPct = Math.round(valid.filter(function (v) { return v >= latest; }).length / total * 100);
       const bottomPct = Math.round(valid.filter(function (v) { return v <= latest; }).length / total * 100);
-      if (topPct <= PERCENTILE_BAND) return '3年内の上位' + topPct + '%';
-      if (bottomPct <= PERCENTILE_BAND) return '3年内の下位' + bottomPct + '%';
+      if (topPct <= PERCENTILE_BAND) return 'top';
+      if (bottomPct <= PERCENTILE_BAND) return 'bottom';
       return null;
+    }
+
+    function percentileLevelPhrase(level) {
+      if (level === 'top') return '(過去3年でも多い水準)';
+      if (level === 'bottom') return '(過去3年でも少ない水準)';
+      return '';
     }
 
     // 各報告者の「基準日以前の最新ratio」を合計する
@@ -918,39 +948,109 @@
       return (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%';
     }
 
-    function buildSignalEvidence(borrowIndicator, shortIndicator, percentileLabel) {
-      const parts = [];
-      if (borrowIndicator.status === 'ok') {
-        let part = '借株残4週' + formatSignedPercent(borrowIndicator.changeRatio);
-        if (percentileLabel) part += '（' + percentileLabel + '）';
-        parts.push(part);
-      } else {
-        parts.push('借株残4週変化: データ不足');
-      }
-      if (shortIndicator.status === 'ok') {
-        parts.push('空売り' + formatRatioPercent(shortIndicator.sumPrior) + '→' + formatRatioPercent(shortIndicator.sumLatest));
-      } else if (shortIndicator.status === 'no-history') {
-        parts.push('空売り現在' + formatRatioPercent(shortIndicator.sumLatest) + '（4週前データなし）');
-      } else if (shortIndicator.status === 'error') {
-        parts.push('空売りデータを取得できません');
-      } else {
-        parts.push('空売り報告なし');
-      }
-      return parts.join('・');
+    function shortDirectionWord(direction) {
+      return direction === 'increase' ? '増加' : (direction === 'decrease' ? '減少' : '横ばい');
     }
 
-    // 純関数: {weeks, issue}(series shard)とevents(shortイベント配列)から表示用データを組み立てる。
-    // computeSignal(weeks, issue, events) という名前でnode -e から直接呼べる形にしてある。
-    function computeSignal(weeks, issue, events, shortFetchFailed) {
+    // 根拠行(増分5.1書式): 「借株残: 4週間で{±X%}{水準句} / 大口空売り: {空売り句}」
+    function buildSignalEvidence(borrowIndicator, shortIndicator, percentileLevel) {
+      let borrowPart;
+      if (borrowIndicator.status === 'ok') {
+        borrowPart = '借株残: 4週間で' + formatSignedPercent(borrowIndicator.changeRatio) + percentileLevelPhrase(percentileLevel);
+      } else {
+        borrowPart = '借株残: データ不足';
+      }
+      let shortPart;
+      if (shortIndicator.status === 'ok') {
+        shortPart = formatRatioPercent(shortIndicator.sumPrior) + '→' + formatRatioPercent(shortIndicator.sumLatest) + '(' + shortDirectionWord(shortIndicator.direction) + ')';
+      } else if (shortIndicator.status === 'no-history') {
+        shortPart = '現在' + formatRatioPercent(shortIndicator.sumLatest) + '(4週前のデータなし)';
+      } else if (shortIndicator.status === 'error') {
+        shortPart = 'データを取得できません';
+      } else {
+        shortPart = '報告なし(0.5%以上の大口空売りをしている機関はいません)';
+      }
+      return borrowPart + ' / 大口空売り: ' + shortPart;
+    }
+
+    // バッジ直下の状況説明文(増分5.1、監督者確定コピー。一字一句このまま使う)
+    function buildStatusText(badge, borrowIndicator, shortIndicator) {
+      if (badge.key === 'insufficient') {
+        return '収録データが8週分に満たないため判定できません(新規上場銘柄など)。';
+      }
+      if (badge.key === 'neutral') {
+        return '借株残・大口空売りに大きな変化はありません。需給に目立った偏りが出ていない状態です。';
+      }
+      const borrowPct = formatSignedPercent(borrowIndicator.changeRatio);
+      if (badge.key === 'pressure-up') {
+        let text = '空売りの元手になる「借株」が4週間で' + borrowPct + '増えています。機関投資家が売りの構えを強めている状態です。';
+        if (shortIndicator.direction === 'increase') text += '大口空売りの残高も増えています。';
+        return text;
+      }
+      // covering
+      return '空売りしていた投資家が、株を買い戻して返す動きを進めています(借株残が4週間で' + borrowPct + ')。売り圧力は弱まる方向です。';
+    }
+
+    // 株価週足の4週変化率: 最新の非null closeと、そこから4本前(非null値で数えて4つ前)の非null closeを比較。
+    // 非null本数が5未満(latest+4本前が確保できない)ならnull
+    function priceWeeklyChange(prices) {
+      const weekly = prices && prices.weekly;
+      const closes = weekly && Array.isArray(weekly.close) ? weekly.close : [];
+      const validValues = closes.filter(isNumber);
+      if (validValues.length < PRICE_TREND_MIN_POINTS) return null;
+      const latest = validValues[validValues.length - 1];
+      const fourBack = validValues[validValues.length - 1 - 4];
+      if (!isNumber(latest) || !isNumber(fourBack) || fourBack === 0) return null;
+      const changeRatio = (latest - fourBack) / fourBack;
+      const direction = changeRatio >= PRICE_CHANGE_THRESHOLD ? 'up'
+        : (changeRatio <= -PRICE_CHANGE_THRESHOLD ? 'down' : 'flat');
+      return { changeRatio: changeRatio, direction: direction };
+    }
+
+    // 株価との照らし合わせ本文(増分5.1、監督者確定コピー。9通りを一字一句このまま使う)
+    function buildPriceComparisonText(priceChange, borrowDirection) {
+      const pct = formatSignedPercent(priceChange.changeRatio);
+      const dir = priceChange.direction;
+      if (dir === 'up' && borrowDirection === 'increase') return '株価が上がる中で空売りも積み増されています。売り方と買い方の綱引きで、さらに上昇が続くと売り方の買い戻し(踏み上げ)が上昇を加速することがあります。';
+      if (dir === 'up' && borrowDirection === 'decrease') return '株価の上昇と同時に空売りの手仕舞いが進んでいます。需給面では上昇を後押しする組み合わせです。';
+      if (dir === 'up') return '株価は4週間で' + pct + '上昇していますが、空売り側に目立った動きはありません。';
+      if (dir === 'down' && borrowDirection === 'increase') return '株価の下落と空売りの積み増しが同時に起きています。売り圧力が強い組み合わせです。';
+      if (dir === 'down' && borrowDirection === 'decrease') return '株価は下落していますが、空売り側も手仕舞いを進めています。売り圧力は峠を越えつつある可能性があります。';
+      if (dir === 'down') return '株価は4週間で' + pct + '下落していますが、空売り側に目立った動きはありません。';
+      if (dir === 'flat' && borrowDirection === 'increase') return '株価は横ばいですが、水面下で空売りが積み上がっています。';
+      if (dir === 'flat' && borrowDirection === 'decrease') return '株価は横ばいのまま、空売りの手仕舞いが進んでいます。';
+      return '株価・需給とも目立った動きはありません。';
+    }
+
+    // 指標1がok(unavailable/insufficientではない)かつ株価収録・週足5本以上のときだけ行を生成。
+    // それ以外はnull(呼び出し側で行自体を出さない)
+    function buildPriceComparisonLine(prices, borrowIndicator) {
+      if (borrowIndicator.status !== 'ok' || !prices) return null;
+      const change = priceWeeklyChange(prices);
+      if (!change) return null;
+      return '株価との照らし合わせ: ' + buildPriceComparisonText(change, borrowIndicator.direction);
+    }
+
+    // 純関数: {weeks, issue}(series shard)・events(shortイベント配列)・prices(価格ペイロード)から
+    // 表示用データを組み立てる。computeSignal(weeks, issue, events, shortFetchFailed, prices) という
+    // 名前でnode -e から直接呼べる形にしてある。
+    function computeSignal(weeks, issue, events, shortFetchFailed, prices) {
       const borrow = borrowBalanceSeries(weeks, issue);
       const borrowIndicator = computeBorrowIndicator(borrow);
       const shortIndicator = computeShortIndicator(events, shortFetchFailed);
       const badge = computeSignalBadge(borrowIndicator, shortIndicator);
-      const percentileLabel = badge.key === 'insufficient' ? null : borrowPercentileLabel(borrow);
-      const evidence = badge.key === 'insufficient'
-        ? '有効週（借株残データがある週）が' + MIN_VALID_WEEKS + '週未満のため判定できません。'
-        : buildSignalEvidence(borrowIndicator, shortIndicator, percentileLabel);
-      return { badge: badge, evidence: evidence, borrowIndicator: borrowIndicator, shortIndicator: shortIndicator };
+      const percentileLevel = badge.key === 'insufficient' ? null : borrowPercentileLevel(borrow);
+      const statusText = buildStatusText(badge, borrowIndicator, shortIndicator);
+      const evidence = badge.key === 'insufficient' ? null : buildSignalEvidence(borrowIndicator, shortIndicator, percentileLevel);
+      const priceComparison = badge.key === 'insufficient' ? null : buildPriceComparisonLine(prices, borrowIndicator);
+      return {
+        badge: badge,
+        statusText: statusText,
+        evidence: evidence,
+        priceComparison: priceComparison,
+        borrowIndicator: borrowIndicator,
+        shortIndicator: shortIndicator
+      };
     }
 
     // RENDER
@@ -1080,7 +1180,10 @@
             '<tbody>' + rows + '</tbody>' +
           '</table></div>' +
         '</section>' +
-        '<p class="note">JSDAは制度貸借を除く一般貸借。貸付残高は転貸ダブルカウントの可能性があり、借株需要の代理変数として見る</p>';
+        '<p class="note">証券会社間で株を貸し借りした残高の推移です。「借入」の増減が空売りの勢いの目安になります。</p>' +
+        '<details class="detail-note"><summary>データの厳密な注意点</summary>' +
+          '<p>JSDAは制度貸借を除く一般貸借。貸付残高は転貸ダブルカウントの可能性があり、借株需要の代理変数として見る</p>' +
+        '</details>';
 
       state.currentChart = { weeks: weeks, issue: issue, priceValues: priceValues };
       // innerHTML代入直後でもgetBoundingClientRectが同期レイアウトを強制するため
@@ -1089,15 +1192,25 @@
       drawChart(document.getElementById('series-chart'), weeks, issue, priceValues);
     }
 
-    function renderSignalCard(target, weeks, issue, events, shortFetchFailed) {
+    function renderSignalCard(target, weeks, issue, events, shortFetchFailed, prices) {
       if (!target) return;
-      const signal = computeSignal(weeks, issue, events, shortFetchFailed);
+      const signal = computeSignal(weeks, issue, events, shortFetchFailed, prices);
+      const evidenceHtml = signal.evidence ? '<p class="signal-evidence">' + escapeHtml(signal.evidence) + '</p>' : '';
+      const priceCompareHtml = signal.priceComparison ? '<p class="signal-price-compare">' + escapeHtml(signal.priceComparison) + '</p>' : '';
       target.innerHTML =
         '<section class="card signal-card" aria-labelledby="signal-title">' +
           '<h2 id="signal-title" class="visually-hidden">需給シグナル</h2>' +
           '<span class="signal-badge ' + signal.badge.className + '">' + escapeHtml(signal.badge.label) + '</span>' +
-          '<p class="signal-evidence">' + escapeHtml(signal.evidence) + '</p>' +
+          '<p class="signal-status-text">' + escapeHtml(signal.statusText) + '</p>' +
+          evidenceHtml +
+          priceCompareHtml +
           '<p class="signal-note">機械的な閾値による参考情報であり売買判断ではありません。</p>' +
+          '<details class="detail-note"><summary>このシグナルの見方(かんたん解説)</summary>' +
+            '<p>・「借株」とは: 機関投資家が空売り(株を借りて売り、値下がり後に買い戻して返す取引)のために借りている株のことです。借株が増える=空売りの準備が進んでいる、減る=買い戻しが進んでいる、と読めます。</p>' +
+            '<p>・「大口空売り」とは: 発行済株式の0.5%以上を空売りすると、機関名の公表が義務付けられています。誰がどれだけ売っているかが見えます。</p>' +
+            '<p>・注意: 貸し借りの集計には又貸し分の二重計上がありえるため、残高の絶対値より「増えているか減っているか」を見るのがコツです。</p>' +
+            '<p>・この判定は決まった計算式(閾値: 借株残4週±10%、空売り残高4週±0.5ポイント)による機械的な参考情報です。</p>' +
+          '</details>' +
         '</section>';
     }
 
@@ -1124,7 +1237,7 @@
       const pricesPromise = loadPrices(code);
 
       renderShortSection(code, requestId, shortShardPromise);
-      renderSignalSection(code, requestId, seriesPromise, shortShardPromise);
+      renderSignalSection(code, requestId, seriesPromise, shortShardPromise, pricesPromise);
 
       try {
         const payload = await seriesPromise;
@@ -1142,13 +1255,14 @@
       }
     }
 
-    async function renderSignalSection(code, requestId, seriesPromise, shortShardPromise) {
+    async function renderSignalSection(code, requestId, seriesPromise, shortShardPromise, pricesPromise) {
       const target = document.getElementById('signal-content');
       if (!target) return;
       let weeks = [];
       let issue = null;
       let events = [];
       let shortFetchFailed = false;
+      let prices = null;
       try {
         const payload = await seriesPromise;
         weeks = payload.weeks;
@@ -1168,12 +1282,15 @@
         events = [];
         shortFetchFailed = true;
       }
+      // 株価との照らし合わせ(増分5.1)は price収録銘柄のみの補足行。fetch失敗・未収録は
+      // 行自体を出さない仕様(buildPriceComparisonLine側で判定)なのでnullフォールバックでよい。
+      try { prices = await pricesPromise; } catch (priceError) { prices = null; }
       if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
       if (!issue) {
         target.innerHTML = '<div class="card status-card">需給シグナルを計算できません。</div>';
         return;
       }
-      renderSignalCard(target, weeks, issue, events, shortFetchFailed);
+      renderSignalCard(target, weeks, issue, events, shortFetchFailed, prices);
     }
 
     function render() {
