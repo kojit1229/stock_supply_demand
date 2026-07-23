@@ -398,3 +398,22 @@ def _main(argv: list[str] | None = None) -> int:
         description="日証金 銘柄別残高一覧(zandaka.csv)からtaishakuスナップショットを増分更新します"
     )
     parser.add_argument("--out", default="data", help="出力dataディレクトリ")
+    parser.add_argument(
+        "--source", help="オフライン用ローカルCSVパス(テスト・手動用。省略時はネットワーク取得)"
+    )
+    args = parser.parse_args(argv)
+    try:
+        updated = run_update(args.out, source=args.source)
+    except Exception as exc:
+        print(f"jsf_taishaku: {exc}", file=sys.stderr)
+        return 1
+    if updated:
+        print(UPDATED_MARKER)
+        print("jsf_taishaku: 日証金スナップショットを更新しました", file=sys.stderr)
+    else:
+        print("jsf_taishaku: 更新対象なし(確報の上書き禁止、または新規データなし)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
