@@ -268,6 +268,80 @@
     .signal-evidence { margin: 12px 0 6px; color: var(--text); font-size: .92rem; }
     .signal-note { margin: 0; color: var(--muted); font-size: .76rem; }
 
+    .confidence-tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0 0; }
+    .confidence-tag {
+      display: inline-block;
+      padding: 3px 10px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface-2);
+      color: var(--muted);
+      font-size: .72rem;
+    }
+    .confidence-tags-link { display: inline-block; margin-top: 8px; color: var(--decrease); font-size: .78rem; text-decoration: none; }
+    .confidence-tags-link:hover { text-decoration: underline; }
+
+    .issue-heading-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+    .watch-toggle-btn, .watch-remove-btn {
+      padding: 8px 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface-2);
+      color: var(--text);
+      font-size: .82rem;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+    .watch-toggle-btn-active { border-color: var(--decrease); color: #bce4d1; }
+    .watch-toggle-btn:disabled { opacity: .5; cursor: not-allowed; }
+    .watch-limit-note { margin: 6px 0 0; color: var(--increase); font-size: .76rem; text-align: right; }
+
+    .watch-count-link {
+      display: inline-flex;
+      margin-bottom: 14px;
+      padding: 10px 14px;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface);
+      color: var(--text);
+      font-size: .86rem;
+      text-decoration: none;
+    }
+    .watch-count-link:hover { border-color: var(--decrease); }
+    .guide-link-inline { color: var(--decrease); text-decoration: none; }
+    .guide-link-inline:hover { text-decoration: underline; }
+
+    .watch-list { display: grid; margin: 0; padding: 0; gap: 10px; list-style: none; }
+    .watch-item { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+    .watch-item-retired { opacity: .8; padding: 14px 16px; }
+    .watch-item-link { display: block; padding: 14px 16px; color: inherit; text-decoration: none; }
+    .watch-item-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+    .watch-item-name { font-weight: 700; }
+    .watch-item-evidence { margin: 8px 0 0; color: var(--muted); font-size: .84rem; }
+    .watch-item-note { margin: 6px 0 10px; color: var(--muted); font-size: .84rem; }
+    .watch-change-badge {
+      display: inline-block;
+      margin: 0 0 8px;
+      padding: 3px 10px;
+      border: 1px solid rgba(240, 179, 76, .45);
+      border-radius: 999px;
+      background: rgba(240, 179, 76, .16);
+      color: #ffcf8a;
+      font-size: .74rem;
+      font-weight: 700;
+    }
+    .watch-no-change { margin: 0 0 12px; color: var(--muted); font-size: .86rem; }
+
+    .glossary-table th, .glossary-table td { text-align: left; white-space: normal; vertical-align: top; }
+    .glossary-table th:first-child, .glossary-table td:first-child { width: 8em; font-weight: 700; }
+    .guide-list { margin: 0 0 4px 1.15em; padding: 0; color: var(--text); }
+    .guide-list li { margin-bottom: 6px; }
+    .guide-section h2 { font-size: 1.05rem; }
+    .guide-section p { color: var(--text); }
+    .guide-section p + p { margin-top: 8px; }
+
     .table-wrap { overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
     th, td { padding: 11px 10px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
@@ -311,6 +385,8 @@
       .hero { padding-top: 18px; }
       .issue-heading { display: block; }
       .issue-heading .issue-code { display: block; margin-top: 4px; }
+      .issue-heading-meta { align-items: flex-start; margin-top: 10px; }
+      .glossary-table th:first-child, .glossary-table td:first-child { width: 6em; }
       .card { padding: 15px; }
       .chart-wrap, #series-chart { min-height: 280px; height: 280px; }
       th, td { padding-inline: 7px; }
@@ -378,6 +454,17 @@
     const PERCENTILE_BAND = 20; // 上位/下位20%
     const PRICE_CHANGE_THRESHOLD = 0.05; // 株価週足4週変化率 ±5%でup/down判定(増分5.1)
     const PRICE_TREND_MIN_POINTS = 5; // 株価週足の非null本数がこれ未満なら株価照らし合わせ行を非表示
+
+    // 増分9: ウォッチリスト(v2-policy.md 設計警告7の契約)。端末間同期なし・localStorageのみ
+    const WATCHLIST_KEY = 'jukyu_watchlist_v1';
+    const WATCHLIST_LIMIT = 50;
+    const SEEN_KEY = 'jukyu_watch_seen_v1';
+    const BADGE_LABELS = Object.freeze({
+      'pressure-up': '売り圧力 積み上がり',
+      'covering': '買い戻し進行',
+      'neutral': '中立',
+      'insufficient': 'データ不足'
+    });
 
     function escapeHtml(value) {
       return String(value)
@@ -466,6 +553,8 @@
     }
 
     function getRoute() {
+      if (location.hash === '#/watch') return { type: 'watch' };
+      if (location.hash === '#/guide') return { type: 'guide' };
       const match = /^#\/issue\/([^/?#]+)$/.exec(location.hash);
       if (!match) return { type: 'search' };
       try {
