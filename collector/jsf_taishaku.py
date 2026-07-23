@@ -198,3 +198,203 @@ def parse_zandaka_text(
     apply_dates: set[str] = set()
     settle_dates: set[str] = set()
     report_types: set[str] = set()
+    issues: dict[str, dict[str, Any]] = {}
+    for offset, row in enumerate(data_rows):
+        row_number = offset + 2  # +1 for header, +1 for 1-index
+        if len(row) != len(EXPECTED_HEADER):
+            raise TaishakuError(f"{row_number}行目の列数が不正です: {len(row)}列")
+        apply_dates.add(row[0])
+        settle_dates.add(row[1])
+        report_types.add(row[6])
+        if row[4] != TOKYO_EXCHANGE_LABEL:
+            continue
+        code = _normalize_code(row[2])
+        if code in issues:
+            raise TaishakuError(f"{row_number}行目: コードが重複しています: {code}")
+        issue: dict[str, Any] = {"name": _normalize_name(row[3])}
+        for column, key, label in _REQUIRED_QUANTITY_COLUMNS:
+            issue[key] = _parse_required_int(row[column], f"{row_number}行目 {label}")
+        for column, key, label in _OPTIONAL_QUANTITY_COLUMNS:
+            issue[key] = _parse_optional_int(row[column], f"{row_number}行目 {label}")
+        issues[code] = issue
+
+    if not issues:
+        raise TaishakuError(f"{TOKYO_EXCHANGE_LABEL!r}行が見つかりません")
+    if len(apply_dates) != 1:
+        raise TaishakuError(f"申込日が複数種類あります: {sorted(apply_dates)!r}")
+    if len(settle_dates) != 1:
+        raise TaishakuError(f"決済日が複数種類あります: {sorted(settle_dates)!r}")
+    if len(report_types) != 1:
+        raise TaishakuError(f"速報／確報が複数種類あります: {sorted(report_types)!r}")
+    report_type = report_types.pop()
+    if report_type not in ("速報", "確報"):
+        raise TaishakuError(f"不正な速報／確報区分です: {report_type!r}")
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "apply_date": _parse_date(apply_dates.pop(), "申込日"),
+        "settle_date": _parse_date(settle_dates.pop(), "決済日"),
+        "report_type": report_type,
+        "issue_count": len(issues),
+        "issues": issues,
+    }
+
+
+def _fetch_csv_bytes(
+    url: str = SOURCE_URL,
+    *,
+    opener: Callable[..., Any] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    timeout: float = DEFAULT_TIMEOUT,
+    user_agent: str = USER_AGENT,
+) -> bytes:
+    # opener はNoneを既定にし、呼び出し時にurlopenへ遅延解決する(collector/prices.py
+    # のrun_collectと同じ流儀)。関数定義時にデフォルト引数として束縛すると、テストが
+    # モジュールの`urlopen`をmock.patch.objectしても効かなくなるため
+    fetch_opener = opener or urlopen
+    request = Request(url, headers={"User-Agent": user_agent})
+    last_error: Exception | None = None
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            with fetch_opener(request, timeout=timeout) as response:
+                return response.read()
+        except Exception as exc:  # noqa: BLE001 -- fail loud once retries exhaust
+            last_error = exc
+            if attempt < MAX_ATTEMPTS - 1:
+                sleep(RETRY_BACKOFF_SECONDS)
+    raise TaishakuError(f"日証金CSVの取得に{MAX_ATTEMPTS}回失敗しました: {url}") from last_error
+
+
+def read_source_text(
+    source: str | os.PathLike[str] | None,
+    *,
+    opener: Callable[..., Any] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    timeout: float = DEFAULT_TIMEOUT,
+    user_agent: str = USER_AGENT,
+) -> str:
+    """Read zandaka.csv bytes (local ``source`` for tests/manual, else network)."""
+    if source is not None:
+        raw = Path(source).read_bytes()
+    else:
+        raw = _fetch_csv_bytes(
+            opener=opener, sleep=sleep, timeout=timeout, user_agent=user_agent
+        )
+    try:
+        return raw.decode("cp932")
+    except UnicodeDecodeError as exc:
+        raise TaishakuError("CSVをcp932でデコードできません") from exc
+
+
+def _generated_at() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _validate_generated_at(value: str) -> None:
+    if not isinstance(value, str) or not value:
+        raise TaishakuError("generated_atは空でないISO 8601文字列である必要があります")
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise TaishakuError(f"不正なgenerated_atです: {value!r}") from exc
+
+
+def _load_existing_snapshot(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise TaishakuError(f"既存スナップショットが読めません: {path}") from exc
+    if not isinstance(document, dict) or document.get("schema_version") != SCHEMA_VERSION:
+        raise TaishakuError(f"schema_versionが不一致です: {path}")
+    if document.get("report_type") not in ("速報", "確報"):
+        raise TaishakuError(f"既存report_typeが不正です: {path}")
+    if document.get("apply_date") != path.stem:
+        raise TaishakuError(f"apply_dateがファイル名と不一致です: {path}")
+    return document
+
+
+def _write_snapshot_and_meta(
+    out_root: Path, snapshot: dict[str, Any], generated_at: str
+) -> None:
+    """Atomically write one taishaku/{apply_date}.json, then rebuild the meta
+    file from a directory listing (self-healing; no cross-run state needed)."""
+    taishaku_dir = out_root / "taishaku"
+    taishaku_dir.mkdir(parents=True, exist_ok=True)
+    target = taishaku_dir / f"{snapshot['apply_date']}.json"
+    rendered = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+
+    fd, tmp_name = tempfile.mkstemp(
+        dir=taishaku_dir, prefix=".tmp-taishaku-", suffix=".json"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(rendered)
+        os.replace(tmp_name, target)
+    except Exception:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+    dates = sorted(
+        path.stem for path in taishaku_dir.glob("*.json") if _ISO_DATE_STEM.fullmatch(path.stem)
+    )
+    if not dates:
+        raise TaishakuError(f"{taishaku_dir} にスナップショットがありません")
+    meta = {
+        "schema_version": META_SCHEMA_VERSION,
+        "latest_apply_date": dates[-1],
+        "generated_at": generated_at,
+        "snapshot_count": len(dates),
+    }
+    meta_text = json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
+    meta_fd, meta_tmp = tempfile.mkstemp(
+        dir=out_root, prefix=".tmp-taishaku-meta-", suffix=".json"
+    )
+    try:
+        with os.fdopen(meta_fd, "w", encoding="utf-8") as handle:
+            handle.write(meta_text)
+        os.replace(meta_tmp, out_root / "taishaku_meta.json")
+    except Exception:
+        Path(meta_tmp).unlink(missing_ok=True)
+        raise
+
+
+def run_update(
+    out_dir: str | os.PathLike[str],
+    *,
+    source: str | os.PathLike[str] | None = None,
+    generated_at: str | None = None,
+    min_data_rows: int = MIN_DATA_ROWS,
+    opener: Callable[..., Any] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Fetch/parse the latest snapshot; write it unless that would be a
+    confirmed->preliminary downgrade. Returns True iff a write happened."""
+    out_root = Path(out_dir)
+    text = read_source_text(source, opener=opener, sleep=sleep)
+    snapshot = parse_zandaka_text(text, min_data_rows=min_data_rows)
+
+    target = out_root / "taishaku" / f"{snapshot['apply_date']}.json"
+    existing = _load_existing_snapshot(target)
+    if (
+        existing is not None
+        and existing.get("report_type") == "確報"
+        and snapshot["report_type"] == "速報"
+    ):
+        return False  # 確報保存済みなら速報でダウングレードしない
+
+    timestamp = generated_at or _generated_at()
+    _validate_generated_at(timestamp)
+    _write_snapshot_and_meta(out_root, snapshot, timestamp)
+    return True
+
+
+def _main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="日証金 銘柄別残高一覧(zandaka.csv)からtaishakuスナップショットを増分更新します"
+    )
+    parser.add_argument("--out", default="data", help="出力dataディレクトリ")
