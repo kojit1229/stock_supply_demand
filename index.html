@@ -987,7 +987,11 @@
         if (shortIndicator.direction === 'increase') text += '大口空売りの残高も増えています。';
         return text;
       }
-      // covering
+      // covering。借株残の変化率が欠測(status!=='ok')でも空売り減少だけでこのバッジになりうるため、
+      // その場合は数値を含まない文言に落とす(「—」の混入防止。2026-07-23 reviewer指摘)
+      if (borrowIndicator.status !== 'ok') {
+        return '大口空売りの残高が減っており、空売りの手仕舞い(買い戻し)が進んでいます。売り圧力は弱まる方向です。';
+      }
       return '空売りしていた投資家が、株を買い戻して返す動きを進めています(借株残が4週間で' + borrowPct + ')。売り圧力は弱まる方向です。';
     }
 
