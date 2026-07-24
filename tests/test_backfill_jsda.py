@@ -14,6 +14,21 @@ from collector import backfill_jsda, jsda_weekly
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 BACKFILL_FIXTURE = FIXTURES / "jsda_backfill_sample.zip"
+# 増分11.5: z+s統合検証専用の新規fixture(既存jsda_backfill_sample.zipは無変更)。
+# 20260710z/s_sample.xlsxの実データ由来バイトを日付違いで詰め直したもの:
+#   2026-01-02: z+s両方(通常の統合週)
+#   2026-01-09: zのみ、s無し(欠落週のフォールバック許容)
+#   2026-01-16: z+s基本形+s訂正版(sの訂正版優先)
+#   20260102j.xlsx: j(対象外)が混じっていても無視されることの確認用ノイズ
+BACKFILL_S_FIXTURE = FIXTURES / "jsda_backfill_s_sample.zip"
+# reviewer指摘B(2)対応(2026-07-24): 半期zip内の1つのsメンバーだけがzip構造
+# レベルで破損(CRC不正)しているケース専用のfixture。
+#   2026-02-02: z+sとも正常(対照週。破損の影響を受けないことを確認する)
+#   2026-02-09: zは正常、sメンバーのみバイト破壊(BadZipFile: Bad CRC-32)
+# 作り方はtests/fixtures配下に置かず本テストファイル側で都度検証しているが、
+# 実体は20260710z/s_sample.xlsxのバイトをそのまま流用し、CRC不整合になるよう
+# 1バイトだけ反転してある(実データ由来バイトの改変)。
+BACKFILL_S_CORRUPT_MEMBER_FIXTURE = FIXTURES / "jsda_backfill_s_corrupt_sample.zip"
 
 
 class BackfillJSDATests(unittest.TestCase):
@@ -41,6 +56,18 @@ class BackfillJSDATests(unittest.TestCase):
         cache = self.root / "cache"
         cache.mkdir()
         shutil.copyfile(BACKFILL_FIXTURE, cache / name)
+        return cache
+
+    def _cache_s_archive(self, name="202601-06.zip"):
+        cache = self.root / "cache"
+        cache.mkdir(exist_ok=True)
+        shutil.copyfile(BACKFILL_S_FIXTURE, cache / name)
+        return cache
+
+    def _cache_s_corrupt_member_archive(self, name="202601-06.zip"):
+        cache = self.root / "cache"
+        cache.mkdir(exist_ok=True)
+        shutil.copyfile(BACKFILL_S_CORRUPT_MEMBER_FIXTURE, cache / name)
         return cache
 
     def test_completed_half_year_archives_cover_three_year_window(self):
@@ -229,6 +256,109 @@ class BackfillJSDATests(unittest.TestCase):
         self.assertIn("2025-09-26", message)
         self.assertIn("銘柄数が下限未満", message)
 
+    # ---- 増分11.5: sの半期zipバックフィル ------------------------------
+
+    def test_select_preferred_s_names_prefers_revision_and_ignores_other_kinds(self):
+        with ZipFile(BACKFILL_S_FIXTURE) as archive:
+            names = archive.namelist()
+        selected = backfill_jsda.select_preferred_s_names(names)
+        self.assertEqual(
+            selected[date(2026, 1, 16)].filename,
+            "20260116s(20260123r).xlsx",
+        )
+        self.assertEqual(selected[date(2026, 1, 2)].filename, "20260102s.xlsx")
+        # jファイル(20260102j.xlsx)はs判定に混ざらない。2026-01-09はzのみで
+        # sが同梱されていない週なので選外(select_preferred_s_namesはs候補のみ扱う)
+        self.assertEqual(set(selected), {date(2026, 1, 2), date(2026, 1, 16)})
+
+    def test_discover_s_urls_index_link_discovery_prefers_revision(self):
+        html = """
+        <a href="files/20260319z.xlsx">z holiday week</a>
+        <a href="files/20260319s.xlsx">s holiday week</a>
+        <a href="files/20260501s.xlsx">original</a>
+        <a href="files/20260501s(20260514r).xlsx">revised</a>
+        <a href="files/20260501j.xlsx">out of scope</a>
+        """
+        links = backfill_jsda.discover_s_urls(html)
+        self.assertIn(date(2026, 3, 19), links)
+        self.assertTrue(links[date(2026, 5, 1)].endswith("20260501s(20260514r).xlsx"))
+        self.assertEqual(len(links), 2)
+
+    def test_backfill_merges_z_and_s_into_weekly_shinki(self):
+        cache = self._cache_s_archive()
+        output = self.root / "data"
+        result = backfill_jsda.run_backfill(
+            date(2026, 1, 2),
+            date(2026, 1, 2),
+            output,
+            cache,
+            today=date(2026, 7, 22),
+            min_issue_count=3,
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.processed_weeks, ["2026-01-02"])
+        self.assertEqual(result.s_missing_weeks, [])
+        document = json.loads(
+            (output / "weekly" / "2026-01-02.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["source_files"], ["20260102z.xlsx", "20260102s.xlsx"])
+        kioxia = document["issues"]["285A"]
+        self.assertNotEqual(kioxia["shinki"], {})
+        self.assertEqual(
+            kioxia["shinki"]["yutanpo"]["lend_qty"], 5_316_474
+        )
+        # z(taishaku)側は増分11.5の影響を受けない
+        self.assertIn("taishaku", kioxia)
+        self.assertNotEqual(kioxia["taishaku"], {})
+
+    def test_backfill_falls_back_to_z_only_when_s_missing_without_failing(self):
+        cache = self._cache_s_archive()
+        output = self.root / "data"
+        result = backfill_jsda.run_backfill(
+            date(2026, 1, 9),
+            date(2026, 1, 9),
+            output,
+            cache,
+            today=date(2026, 7, 22),
+            min_issue_count=3,
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.failures, [])
+        self.assertEqual(result.processed_weeks, ["2026-01-09"])
+        self.assertEqual(result.s_missing_weeks, ["2026-01-09"])
+        document = json.loads(
+            (output / "weekly" / "2026-01-09.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["source_files"], ["20260109z.xlsx"])
+        for issue in document["issues"].values():
+            self.assertEqual(issue["shinki"], {})
+            self.assertNotEqual(issue["taishaku"], {})
+
+    def test_backfill_prefers_revised_s_source_over_base_s_file(self):
+        cache = self._cache_s_archive()
+        output = self.root / "data"
+        result = backfill_jsda.run_backfill(
+            date(2026, 1, 16),
+            date(2026, 1, 16),
+            output,
+            cache,
+            today=date(2026, 7, 22),
+            min_issue_count=3,
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.s_missing_weeks, [])
+        document = json.loads(
+            (output / "weekly" / "2026-01-16.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            document["source_files"], ["20260116z.xlsx", "20260116s(20260123r).xlsx"]
+        )
+
+    def test_backfill_passes_min_issue_count_through_z_plus_s_path(self):
+        # z+sマージ経路でも、build_z_weekly単独経路と同じmin_issue_count下限が
 
 if __name__ == "__main__":
     unittest.main()
