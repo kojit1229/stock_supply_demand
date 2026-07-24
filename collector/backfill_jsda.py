@@ -354,6 +354,55 @@ def _extract_archive_s_candidates(
     呼び出し側(run_backfill)がアーカイブ単位でs_noticesへ記録する。
 
     reviewer指摘A(2026-07-24)対応: メンバー単位の抽出(archive.open→copyfileobj)は
+    個別にtry/exceptで囲む。zip内の特定週のsメンバー1本だけが破損(CRC不正等)
+    していても、その週だけを ``notices`` (戻り値の2要素目、週を特定できる文言)
+    へ記録して処理を継続し、他の週のsは正常に取り込む(以前は関数全体が
+    1つのtry/exceptで、1メンバーの破損が半期全体のs欠落を招いていた)。
+    """
+    try:
+        archive = ZipFile(archive_path)
+    except (BadZipFile, OSError, RuntimeError) as exc:
+        raise BackfillError(f"zip(sファイル)を展開できません: {archive_path}") from exc
+    try:
+        try:
+            infos_by_name = {
+                Path(info.filename).name: info
+                for info in archive.infolist()
+                if not info.is_dir() and Path(info.filename).name
+            }
+            preferred = select_preferred_s_names(infos_by_name)
+            destination_dir = extract_root / (archive_path.stem + "-s")
+            destination_dir.mkdir(parents=True, exist_ok=True)
+        except (BadZipFile, OSError, RuntimeError) as exc:
+            raise BackfillError(f"zip(sファイル)を展開できません: {archive_path}") from exc
+
+        candidates: list[WeeklyCandidate] = []
+        notices: list[str] = []
+        for report_date, sname in sorted(preferred.items()):
+            if not start <= report_date <= end:
+                continue
+            destination = destination_dir / sname.filename
+            try:
+                with archive.open(infos_by_name[sname.filename]) as source, destination.open(
+                    "wb"
+                ) as output:
+                    shutil.copyfileobj(source, output)
+            except (BadZipFile, OSError, RuntimeError) as exc:
+                try:
+                    destination.unlink()
+                except FileNotFoundError:
+                    pass
+                notices.append(
+                    f"{archive_path.name} {report_date.isoformat()} "
+                    f"({sname.filename}): sメンバーを展開できません: {exc}"
+                )
+                continue
+            candidates.append(WeeklyCandidate(sname, destination))
+        return candidates, notices
+    finally:
+        archive.close()
+
+
 def _merge_candidates(candidates: Iterable[WeeklyCandidate]) -> dict[date, WeeklyCandidate]:
     selected: dict[date, WeeklyCandidate] = {}
     for candidate in candidates:
@@ -422,6 +471,10 @@ def run_backfill(
     failures: list[str] = []
     processed: list[str] = []
     candidates: list[WeeklyCandidate] = []
+    # 増分11.5: sは任意扱い。抽出/取得の失敗はここに集めるだけで、failuresには
+    # 混ぜない(sが本当に存在しない週を許容するため=フェイルラウドの対象外)
+    s_candidates: list[WeeklyCandidate] = []
+    s_notices: list[str] = []
 
     with tempfile.TemporaryDirectory(prefix="jsda-backfill-") as temp_name:
         extract_root = Path(temp_name)
@@ -435,6 +488,15 @@ def run_backfill(
                 )
             except Exception as exc:
                 failures.append(f"{archive_name}: {exc}")
+                continue
+            try:
+                new_s_candidates, new_s_notices = _extract_archive_s_candidates(
+                    archive_path, extract_root, start, end
+                )
+                s_candidates.extend(new_s_candidates)
+                s_notices.extend(new_s_notices)
+            except Exception as exc:
+                s_notices.append(f"{archive_name}: {exc}")
 
         current_half = _half_start(effective_today)
         if end >= current_half:
@@ -445,6 +507,7 @@ def run_backfill(
                 # Link targets are ASCII; replacement keeps discovery working even
                 # if JSDA changes the surrounding Japanese page encoding.
                 index_html = index_path.read_bytes().decode("utf-8", errors="replace")
+                discovered_s = discover_s_urls(index_html)
                 for report_date, url in sorted(discover_z_urls(index_html).items()):
                     if not (start <= report_date <= end and report_date >= current_half):
                         continue
@@ -457,6 +520,21 @@ def run_backfill(
                         candidates.append(WeeklyCandidate(zname, source_path))
                     except Exception as exc:
                         failures.append(f"{report_date.isoformat()} ({filename}): {exc}")
+                    # sも同じ週について取得を試みる(JSDAは連続リクエストでブロック
+                    # される実績があるため、CachedDownloaderの間隔制御に乗せて
+                    # z取得の直後に1件ずつ取る。失敗してもfailuresには入れない)
+                    s_url = discovered_s.get(report_date)
+                    if s_url is None:
+                        continue
+                    s_filename = Path(unquote(urlparse(s_url).path)).name
+                    try:
+                        s_source_path = fetcher.fetch(s_url, cache_root / s_filename)
+                        sname = parse_s_name(s_filename)
+                        if sname is None:
+                            raise BackfillError(f"sファイル名ではありません: {s_filename}")
+                        s_candidates.append(WeeklyCandidate(sname, s_source_path))
+                    except Exception as exc:
+                        s_notices.append(f"{report_date.isoformat()} ({s_filename}): {exc}")
             except Exception as exc:
                 failures.append(f"index: {exc}")
 
@@ -465,14 +543,35 @@ def run_backfill(
         except Exception as exc:
             failures.append(f"候補選別: {exc}")
             selected = {}
+        try:
+            selected_s = _merge_candidates(s_candidates)
+        except Exception as exc:
+            s_notices.append(f"s候補選別: {exc}")
+            selected_s = {}
 
         if not selected and not failures:
             failures.append(f"{start.isoformat()}..{end.isoformat()}: 対象zファイルがありません")
 
+        s_missing_weeks: list[str] = []
         for report_date, candidate in sorted(selected.items()):
             week_text = report_date.isoformat()
             destination = weekly_dir / f"{week_text}.json"
+            s_candidate = selected_s.get(report_date)
             try:
+                if s_candidate is not None:
+                    document = jsda_weekly.build_weekly(
+                        candidate.path,
+                        s_candidate.path,
+                        week_text,
+                        min_issue_count=minimum,
+                    )
+                else:
+                    s_missing_weeks.append(week_text)
+                    document = jsda_weekly.build_z_weekly(
+                        candidate.path,
+                        week_text,
+                        min_issue_count=minimum,
+                    )
                 _write_weekly(destination, document)
                 processed.append(week_text)
             except Exception as exc:
@@ -490,6 +589,7 @@ def run_backfill(
             build_site.build_site(weekly_dir, output_root, _generated_at())
         except Exception as exc:
             failures.append(f"build_site: {exc}")
+    return BackfillResult(processed, failures, s_missing_weeks, s_notices)
 
 
 def _parse_cli_date(value: str, label: str) -> date:
@@ -546,6 +646,16 @@ def _main(argv: list[str] | None = None) -> int:
         f"backfill_jsda: {len(result.processed_weeks)}週を処理しました "
         f"({result.processed_weeks[0]}..{result.processed_weeks[-1]})"
     )
+    # 増分11.5: sの欠落はフェイルラウド対象外だが、可視化のため件数だけ出す
+    # (exit_codeには影響しない)
+    if result.s_missing_weeks:
+        print(
+            f"backfill_jsda: sファイルが見つからずshinki空のままの週: "
+            f"{len(result.s_missing_weeks)}件 ({', '.join(result.s_missing_weeks)})",
+            file=sys.stderr,
+        )
+    for notice in result.s_notices:
+        print(f"backfill_jsda: sファイル取得の非致命的な問題: {notice}", file=sys.stderr)
     return 0
 
 
