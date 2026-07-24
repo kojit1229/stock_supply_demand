@@ -30,6 +30,9 @@ META_SCHEMA_VERSION = "supply_demand_meta_v1"
 MAX_WEEKS = 160
 
 _SERIES_FIELDS = ("lend_qty", "own_qty", "ten_qty", "lend_amt")
+# 増分11(2026-07-24確定、design.md §4): weekly/*.jsonのshinki(新規成約高)生値から
+# 算出する後方互換の追加系列。既存の_SERIES_FIELDS(z=残高)とは別枠で扱う
+_S_SERIES_FIELDS = ("s_borrow_qty", "s_lend_qty")
 _TAISHAKU_FIELDS = (
     "lend_qty",
     "lend_amt",
@@ -70,17 +73,17 @@ def _validate_report_date(value: Any, path: Path) -> str:
 
 
 def _validate_measurements(
-    measurements: Any, *, path: Path, code: str, collateral: str
+    measurements: Any, *, path: Path, code: str, collateral: str, kind: str = "taishaku"
 ) -> None:
     if not isinstance(measurements, dict):
         raise BuildSiteError(
-            f"taishaku.{collateral} must be an object for {code} in {path}"
+            f"{kind}.{collateral} must be an object for {code} in {path}"
         )
     for field in _TAISHAKU_FIELDS:
         value = measurements.get(field)
         if isinstance(value, bool) or not isinstance(value, int):
             raise BuildSiteError(
-                f"taishaku.{collateral}.{field} must be an integer "
+                f"{kind}.{collateral}.{field} must be an integer "
                 f"for {code} in {path}"
             )
 
@@ -99,7 +102,8 @@ def _validate_issues(value: Any, path: Path) -> dict[str, dict[str, Any]]:
         taishaku = issue.get("taishaku")
         if not isinstance(taishaku, dict):
             raise BuildSiteError(f"issue {code} has invalid taishaku data in {path}")
-        if not isinstance(issue.get("shinki"), dict):
+        shinki = issue.get("shinki")
+        if not isinstance(shinki, dict):
             raise BuildSiteError(f"issue {code} has invalid shinki data in {path}")
         for collateral in _COLLATERAL_TYPES:
             if collateral in taishaku:
@@ -108,6 +112,17 @@ def _validate_issues(value: Any, path: Path) -> dict[str, dict[str, Any]]:
                     path=path,
                     code=code,
                     collateral=collateral,
+                )
+            # shinki(新規成約高)はtaishakuと同一の6フィールド構造(design.md §4)。
+            # 増分11でs_borrow_qty/s_lend_qtyの算出に使うため、taishaku同様に検証する
+            # (これまでは未使用のため未検証だった)
+            if collateral in shinki:
+                _validate_measurements(
+                    shinki[collateral],
+                    path=path,
+                    code=code,
+                    collateral=collateral,
+                    kind="shinki",
                 )
     return value
 
@@ -156,10 +171,15 @@ def _load_weekly_documents(weekly_dir: Path) -> list[dict[str, Any]]:
             )
 
         _validate_issues(document.get("issues"), path)
-        # ビルダーが使うのはtaishaku/nameのみ。shinki(週次約4千銘柄×6値)を
-        # 160週分保持するとピークメモリが倍増するため、検証後に落とす
+        # ビルダーが使うのはtaishaku/name/shinki由来の合算2値のみ。生shinki(週次
+        # 約4千銘柄×6値×2担保区分)を160週分保持するとピークメモリが倍増するため、
+        # 検証直後にs_borrow_qty/s_lend_qty(増分11)へ圧縮してから生データは落とす
         for issue in document["issues"].values():
-            issue.pop("shinki", None)
+            shinki = issue.pop("shinki")
+            issue["s_lend_qty"] = _combined_value(shinki, "lend_qty")
+            issue["s_borrow_qty"] = _null_safe_sum(
+                _combined_value(shinki, "own_qty"), _combined_value(shinki, "ten_qty")
+            )
         seen_weeks[report_date] = path
         documents.append(document)
 
@@ -174,6 +194,18 @@ def _combined_value(taishaku: dict[str, Any], field: str) -> int | None:
         if collateral in taishaku
     ]
     return sum(values) if values else None
+
+
+def _null_safe_sum(*values: int | None) -> int | None:
+    """Sum the non-null operands; null iff every operand is null.
+
+    増分11のs_borrow_qty(借入(自己)+借入(転貸))合算規則(design.md §4「片方null
+    片方数値なら数値を採用、両方nullならnull」)。_combined_valueと組み合わせて
+    使う場合、担保区分の内側フィールドは常に揃って存在/不在になる(jsda_weekly.py
+    が前週比列以外をNone許容しないため)ので、この汎用実装は_combined_value自身の
+    「一部担保区分のみ存在」規則とも整合する。"""
+    present = [value for value in values if value is not None]
+    return sum(present) if present else None
 
 
 def _assemble_outputs(
@@ -201,15 +233,21 @@ def _assemble_outputs(
     shard_issues: dict[str, dict[str, Any]] = {}
     for code in sorted(latest_names):
         series = {field: [] for field in _SERIES_FIELDS}
+        for field in _S_SERIES_FIELDS:
+            series[field] = []
         for document in retained:
             issue = document["issues"].get(code)
             if issue is None:
                 for field in _SERIES_FIELDS:
                     series[field].append(None)
+                for field in _S_SERIES_FIELDS:
+                    series[field].append(None)
                 continue
             taishaku = issue["taishaku"]
             for field in _SERIES_FIELDS:
                 series[field].append(_combined_value(taishaku, field))
+            for field in _S_SERIES_FIELDS:
+                series[field].append(issue[field])
 
         shard = code[:2]
         shard_issues.setdefault(shard, {})[code] = {
