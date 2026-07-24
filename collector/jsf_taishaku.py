@@ -498,6 +498,122 @@ def _load_existing_series_shards(
                         isinstance(value, bool) or not isinstance(value, int)
                     ):
                         return None
+        shards[path.stem] = document
+
+    return shards, (reference_dates or [])
+
+
+def _merge_snapshot_into_series(
+    shards: dict[str, dict[str, Any]],
+    dates: list[str],
+    snapshot: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Fold one already-validated snapshot into already-loaded series shards.
+
+    冪等: 同一apply_date(dates[-1]と一致)の再処理(速報→確報)は末尾を差し替え、
+    二重追加しない。新しい日は末尾に追加する。既存shardに無い銘柄・当日
+    スナップショットに無い銘柄はどちらもnullで埋める(出現・消滅の両方に対応)。
+    500日窓を超えたら先頭から切り詰める。
+    """
+    apply_date = snapshot["apply_date"]
+    issues = snapshot["issues"]
+
+    if dates and apply_date < dates[-1]:
+        raise TaishakuError(
+            "taishaku_seriesの日付が逆行しています(直近の記録より前の日付を"
+            f"追加しようとしました): {apply_date} < {dates[-1]}"
+        )
+    replace_last = bool(dates) and dates[-1] == apply_date
+    working_dates = list(dates) if replace_last else dates + [apply_date]
+    drop_count = max(0, len(working_dates) - MAX_SERIES_DATES)
+    working_dates = working_dates[drop_count:]
+
+    old_by_code: dict[str, dict[str, list[Any]]] = {}
+    for document in shards.values():
+        old_by_code.update(document.get("issues", {}))
+
+    all_codes = set(old_by_code) | set(issues)
+    shard_documents: dict[str, dict[str, Any]] = {}
+    for code in sorted(all_codes):
+        old_series = old_by_code.get(code)
+        today_issue = issues.get(code)
+        merged: dict[str, list[Any]] = {}
+        for field in SERIES_FIELDS:
+            old_values = (
+                old_series[field] if old_series is not None else [None] * len(dates)
+            )
+            today_value = today_issue[field] if today_issue is not None else None
+            base = old_values[drop_count:-1] if replace_last else old_values[drop_count:]
+            merged[field] = base + [today_value]
+        shard = code[:2]
+        shard_documents.setdefault(
+            shard,
+            {
+                "schema_version": SERIES_SCHEMA_VERSION,
+                "dates": working_dates,
+                "issues": {},
+            },
+        )["issues"][code] = merged
+    return shard_documents
+
+
+def _write_series_shards(
+    out_root: Path,
+    shard_documents: dict[str, dict[str, Any]],
+    *,
+    prune_stale: bool,
+) -> None:
+    """Atomically write taishaku_series/{shard}.json (tmp+rename per file,
+    matching the existing snapshot/meta convention). ``prune_stale`` deletes
+    shard files not present in ``shard_documents`` and is only used by the
+    rebuild path (the incremental path never orphans a shard)."""
+    series_dir = out_root / "taishaku_series"
+    series_dir.mkdir(parents=True, exist_ok=True)
+    for shard, document in shard_documents.items():
+        rendered = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+        fd, tmp_name = tempfile.mkstemp(
+            dir=series_dir, prefix=f".tmp-taishaku-series-{shard}-", suffix=".json"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(rendered)
+            os.replace(tmp_name, series_dir / f"{shard}.json")
+        except Exception:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
+    if prune_stale:
+        keep = {f"{shard}.json" for shard in shard_documents}
+        for path in series_dir.glob("*.json"):
+            if path.name not in keep:
+                path.unlink()
+
+
+def rebuild_series(out_dir: str | os.PathLike[str]) -> dict[str, dict[str, Any]]:
+    """Fully rebuild taishaku_series/ from every snapshot under taishaku/.
+
+    自己修復の公開エントリポイント。run_updateはshardが無い・壊れている場合に
+    これを自動的に呼ぶ。手動復旧目的で単独呼び出しもできる(CLIフラグは無い:
+    増分更新パスが自動的に自己修復するため、daily.yml側の変更は不要)。
+    """
+    out_root = Path(out_dir)
+    snapshots = _load_all_snapshots(out_root / "taishaku")
+    shard_documents = _build_series_documents(snapshots)
+    _write_series_shards(out_root, shard_documents, prune_stale=True)
+    return shard_documents
+
+
+def _update_series(out_root: Path, snapshot: dict[str, Any]) -> None:
+    """Increment taishaku_series/ after a snapshot write, or rebuild it if the
+    on-disk state is missing/broken (increment 14a self-healing)."""
+    loaded = _load_existing_series_shards(out_root / "taishaku_series")
+    if loaded is None:
+        rebuild_series(out_root)
+        return
+    shards, dates = loaded
+    shard_documents = _merge_snapshot_into_series(shards, dates, snapshot)
+    _write_series_shards(out_root, shard_documents, prune_stale=False)
+
+
 def run_update(
     out_dir: str | os.PathLike[str],
     *,
@@ -525,6 +641,10 @@ def run_update(
     timestamp = generated_at or _generated_at()
     _validate_generated_at(timestamp)
     _write_snapshot_and_meta(out_root, snapshot, timestamp)
+    # 増分14a: スナップショット書き込みが起きたときだけ、同じ実行内で
+    # taishaku_seriesを増分更新する(確報ダウングレードでスキップした場合は
+    # 上のreturn Falseで既にここへ到達しない)
+    _update_series(out_root, snapshot)
     return True
 
 
