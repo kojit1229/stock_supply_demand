@@ -1,8 +1,10 @@
 import csv
 import io
 import json
+import shutil
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -35,6 +37,36 @@ def _rewrite_report_type(text: str, report_type: str) -> str:
     header, data = rows[0], rows[1:]
     for row in data:
         row[6] = report_type
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\r\n")
+    writer.writerow(header)
+    writer.writerows(data)
+    return out.getvalue()
+
+
+def _with_apply_date(text: str, apply_date: str, settle_date: str) -> str:
+    """Return a copy of a zandaka.csv body with 申込日/決済日 rewritten for every
+    row (JSDA slash format, e.g. '2026/07/23'). Used to synthesize a second
+    (or later) day's snapshot from the single-day real fixture."""
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    header, data = rows[0], rows[1:]
+    for row in data:
+        row[0] = apply_date
+        row[1] = settle_date
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\r\n")
+    writer.writerow(header)
+    writer.writerows(data)
+    return out.getvalue()
+
+
+def _mutate_rows(text, mutate):
+    """Apply ``mutate(data_rows)`` in place and re-render the CSV body."""
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    header, data = rows[0], rows[1:]
+    mutate(data)
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\r\n")
     writer.writerow(header)
@@ -191,6 +223,11 @@ class JSFTaishakuTests(unittest.TestCase):
             min_data_rows=SMALL_MIN_ROWS,
         )
         self.assertTrue(updated_first)
+        series_before = {
+            path.relative_to(out).as_posix(): path.read_bytes()
+            for path in (out / "taishaku_series").glob("*.json")
+        }
+        self.assertTrue(series_before)  # 前提: 増分14aで作られているはず
 
         preliminary_text = _rewrite_report_type(self.fixture_text, "速報")
         preliminary_source = self._write_source(preliminary_text, "preliminary.csv")
@@ -206,6 +243,14 @@ class JSFTaishakuTests(unittest.TestCase):
         self.assertEqual(snapshot["report_type"], "確報")
         meta = json.loads((out / "taishaku_meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["generated_at"], GENERATED_AT)  # metaは書き換わっていない
+        # reviewer指摘A(増分14a): ダウングレードでスキップした経路はseriesにも
+        # 触れない(_update_seriesがsnapshot書き込みと同じreturn Falseガードの
+        # 内側にあることの固定化、バイト単位で無変更)
+        series_after = {
+            path.relative_to(out).as_posix(): path.read_bytes()
+            for path in (out / "taishaku_series").glob("*.json")
+        }
+        self.assertEqual(series_before, series_after)
 
     def test_preliminary_then_confirmed_overwrites(self):
         out = self.root / "data"
@@ -253,6 +298,8 @@ class JSFTaishakuTests(unittest.TestCase):
             self.assertEqual((out / relative).read_bytes(), content)
         self.assertTrue((out / "taishaku" / "2026-07-22.json").is_file())
         self.assertTrue((out / "taishaku_meta.json").is_file())
+        # 増分14a: taishaku_seriesも同じ書き手が作る(他の書き手の領域は侵さない)
+        self.assertTrue((out / "taishaku_series" / "13.json").is_file())
 
     def test_atomic_write_leaves_no_tmp_files_behind(self):
         out = self.root / "data"
@@ -260,7 +307,11 @@ class JSFTaishakuTests(unittest.TestCase):
         jsf_taishaku.run_update(
             out, source=source, generated_at=GENERATED_AT, min_data_rows=SMALL_MIN_ROWS
         )
-        leftovers = list((out / "taishaku").glob(".tmp-*")) + list(out.glob(".tmp-*"))
+        leftovers = (
+            list((out / "taishaku").glob(".tmp-*"))
+            + list(out.glob(".tmp-*"))
+            + list((out / "taishaku_series").glob(".tmp-*"))
+        )
         self.assertEqual(leftovers, [])
 
     # ---- CLI / UPDATED marker --------------------------------------
@@ -392,6 +443,119 @@ class JSFTaishakuTests(unittest.TestCase):
             )
         self.assertIsInstance(ctx3.exception.__cause__, AssertionError)
 
+    # ---- 増分14a: taishaku_series/{XX}.json --------------------------
+
+    def test_series_first_build_and_incremental_append(self):
+        # 初回構築(1日目)+増分追加(2日目)
+        out = self.root / "data"
+        day1 = self._write_source(self.fixture_text, "day1.csv")
+        jsf_taishaku.run_update(
+            out, source=day1, generated_at=GENERATED_AT, min_data_rows=SMALL_MIN_ROWS
+        )
+        shard = json.loads((out / "taishaku_series" / "13.json").read_text(encoding="utf-8"))
+        self.assertEqual(shard["schema_version"], 1)
+        self.assertEqual(shard["dates"], ["2026-07-22"])
+        self.assertEqual(shard["issues"]["1301"]["yushi_zan"], [8200])
+        self.assertEqual(set(shard["issues"]["1301"]), set(jsf_taishaku.SERIES_FIELDS))
+
+        day2_text = _with_apply_date(self.fixture_text, "2026/07/23", "2026/07/27")
+        day2 = self._write_source(day2_text, "day2.csv")
+        jsf_taishaku.run_update(
+            out, source=day2, generated_at="2026-07-23T09:00:00Z", min_data_rows=SMALL_MIN_ROWS
+        )
+        shard = json.loads((out / "taishaku_series" / "13.json").read_text(encoding="utf-8"))
+        self.assertEqual(shard["dates"], ["2026-07-22", "2026-07-23"])
+        self.assertEqual(shard["issues"]["1301"]["yushi_zan"], [8200, 8200])
+        for field in jsf_taishaku.SERIES_FIELDS:
+            self.assertEqual(len(shard["issues"]["1301"][field]), 2)
+
+    def test_series_same_apply_date_reprocess_replaces_last_value(self):
+        # 速報→確報の同日差し替え: 二重追加せず末尾を新しい値で上書きする
+        out = self.root / "data"
+        preliminary_text = _rewrite_report_type(self.fixture_text, "速報")
+        preliminary_text = _mutate_rows(
+            preliminary_text,
+            lambda rows: [row.__setitem__(9, "1000") for row in rows if row[2] == "1301"],
+        )
+        preliminary_source = self._write_source(preliminary_text, "preliminary.csv")
+        jsf_taishaku.run_update(
+            out,
+            source=preliminary_source,
+            generated_at=GENERATED_AT,
+            min_data_rows=SMALL_MIN_ROWS,
+        )
+        shard = json.loads((out / "taishaku_series" / "13.json").read_text(encoding="utf-8"))
+        self.assertEqual(shard["dates"], ["2026-07-22"])
+        self.assertEqual(shard["issues"]["1301"]["yushi_zan"], [1000])
+
+        confirmed_source = self._write_source(self.fixture_text, "confirmed.csv")  # yushi_zan=8200
+        jsf_taishaku.run_update(
+            out,
+            source=confirmed_source,
+            generated_at="2026-07-22T18:00:00Z",
+            min_data_rows=SMALL_MIN_ROWS,
+        )
+        shard = json.loads((out / "taishaku_series" / "13.json").read_text(encoding="utf-8"))
+        # 二重追加されず、同じ1日分のまま末尾(唯一の要素)が確報値に差し替わる
+        self.assertEqual(shard["dates"], ["2026-07-22"])
+        self.assertEqual(shard["issues"]["1301"]["yushi_zan"], [8200])
+
+    def test_series_handles_new_and_vanished_issues_with_null_fill(self):
+        # 銘柄の出現・消滅: 1301が2日目に消え、9001が2日目に新規出現する
+        out = self.root / "data"
+        day1 = self._write_source(self.fixture_text, "day1.csv")
+        jsf_taishaku.run_update(
+            out, source=day1, generated_at=GENERATED_AT, min_data_rows=SMALL_MIN_ROWS
+        )
+
+        def mutate_day2(rows):
+            rows[:] = [row for row in rows if row[2] != "1301"]
+            new_row = list(rows[0])
+            new_row[2] = "9001"
+            new_row[3] = "テスト新規銘柄"
+            new_row[4] = jsf_taishaku.TOKYO_EXCHANGE_LABEL
+            rows.append(new_row)
+
+        day2_text = _with_apply_date(self.fixture_text, "2026/07/23", "2026/07/27")
+        day2_text = _mutate_rows(day2_text, mutate_day2)
+        day2 = self._write_source(day2_text, "day2.csv")
+        jsf_taishaku.run_update(
+            out, source=day2, generated_at="2026-07-23T09:00:00Z", min_data_rows=SMALL_MIN_ROWS
+        )
+
+        shard_13 = json.loads((out / "taishaku_series" / "13.json").read_text(encoding="utf-8"))
+        self.assertEqual(shard_13["dates"], ["2026-07-22", "2026-07-23"])
+        # 1301は2日目に不在なのでnullで埋まる(消滅)
+        self.assertEqual(shard_13["issues"]["1301"]["yushi_zan"], [8200, None])
+
+        shard_90 = json.loads((out / "taishaku_series" / "90.json").read_text(encoding="utf-8"))
+        self.assertEqual(shard_90["dates"], ["2026-07-22", "2026-07-23"])
+        # 9001は1日目に不在なので過去分がnullで埋まる(新規出現)
+        self.assertIsNone(shard_90["issues"]["9001"]["yushi_zan"][0])
+        self.assertIsNotNone(shard_90["issues"]["9001"]["yushi_zan"][1])
+
+    def test_merge_snapshot_into_series_trims_to_500_day_window(self):
+        # 500日窓: 直接_merge_snapshot_into_seriesを叩き、500件で先頭が
+        # 落ちることを確認する(500回run_updateする実運用相当のテストは
+        # 過剰なので、窓トリムのロジック単体を検証する)
+        # _merge_snapshot_into_series自体は日付フォーマットを検証しない
+        # (それは_load_existing_series_shards側の責務)ので、順序さえ保たれる
+        # 単純な連番文字列で500件用意する(実日付である必要はない)
+        dates = [f"D{i:04d}" for i in range(500)]
+        shards = {
+            "13": {
+                "schema_version": 1,
+                "dates": dates,
+                "issues": {
+                    "1301": {field: [i for i in range(500)] for field in jsf_taishaku.SERIES_FIELDS}
+                },
+            }
+        }
+        snapshot = {
+            "apply_date": "D0500",
+            "issues": {
+                "1301": {field: 999 for field in jsf_taishaku.SERIES_FIELDS},
+            },
 
 if __name__ == "__main__":
     unittest.main()
