@@ -218,6 +218,17 @@
 
     .price-summary { color: var(--muted); font-size: .82rem; }
 
+    .short-marker-list {
+      display: grid;
+      margin: 0 0 12px;
+      padding: 0;
+      gap: 4px;
+      list-style: none;
+      color: var(--muted);
+      font-size: .8rem;
+      font-variant-numeric: tabular-nums;
+    }
+
     .chart-wrap { position: relative; width: 100%; min-height: 320px; }
     #series-chart { display: block; width: 100%; height: 320px; }
 
@@ -454,6 +465,8 @@
     const PERCENTILE_BAND = 20; // 上位/下位20%
     const PRICE_CHANGE_THRESHOLD = 0.05; // 株価週足4週変化率 ±5%でup/down判定(増分5.1)
     const PRICE_TREND_MIN_POINTS = 5; // 株価週足の非null本数がこれ未満なら株価照らし合わせ行を非表示
+    const SHORT_MARKER_THRESHOLD_PT = 0.1; // 空売りイベントマーカー: 前週末比 ±0.1ptで▲▽判定(増分10)
+    const SHORT_MARKER_LIST_LIMIT = 5; // 明細リストの直近件数
 
     // 増分9: ウォッチリスト(v2-policy.md 設計警告7の契約)。端末間同期なし・localStorageのみ
     const WATCHLIST_KEY = 'jukyu_watchlist_v1';
@@ -823,6 +836,22 @@
       return (Math.round(value * 10000) / 100).toFixed(2) + '%';
     }
 
+    // 増分10.5(design.md §4「報告終了イベント」): 実際の報告ratioは常に0.5%以上のため、
+    // 合計値が厳密に0になるのは「収録中の報告者が全員below_threshold(0.5%未満に低下)」の
+    // 場合のみ(通常の空売りが本当にゼロという意味ではない)。合計系の表示にだけ使う
+    function formatShortSumPercent(value) {
+      if (isNumber(value) && value === 0) return '0.5%未満';
+      return formatRatioPercent(value);
+    }
+
+    // 報告者ごとの1件の表示。below_threshold(そのイベント単体が「0.5%未満に低下」を表す
+    // 合成イベント)は「0.00%」ではなく低下日付つきで表示する。qtyはnullなのでformatNumberが
+    // 既存の挙動で「—」を返す(変更不要)
+    function formatShortRatioCell(event) {
+      if (event && event.below_threshold) return '0.5%未満に低下(' + shortDate(event.date) + ')';
+      return formatRatioPercent(event ? event.ratio : null);
+    }
+
     function shortSellerRows(events) {
       const bySeller = Object.create(null);
       events.forEach(function (event) {
@@ -850,7 +879,7 @@
         return '<tr>' +
           '<td>' + escapeHtml(event.seller) + '</td>' +
           '<td>' + escapeHtml(event.date) + '</td>' +
-          '<td>' + formatRatioPercent(event.ratio) + '</td>' +
+          '<td>' + escapeHtml(formatShortRatioCell(event)) + '</td>' +
           '<td>' + formatNumber(event.qty) + '</td>' +
         '</tr>';
       }).join('');
@@ -860,7 +889,7 @@
         return '<tr>' +
           '<td>' + escapeHtml(event.date) + '</td>' +
           '<td>' + escapeHtml(event.seller) + '</td>' +
-          '<td>' + formatRatioPercent(event.ratio) + '</td>' +
+          '<td>' + escapeHtml(formatShortRatioCell(event)) + '</td>' +
           '<td>' + formatNumber(event.qty) + '</td>' +
         '</tr>';
       }).join('');
@@ -900,7 +929,10 @@
     }
 
     // CHART
-    function drawChart(canvas, weeks, issue, priceValues) {
+    const SHORT_MARKER_UP_COLOR = '#F0B34C'; // badge-orange(積み上がり)と同系統
+    const SHORT_MARKER_DOWN_COLOR = '#73A9DF'; // badge-blue(買い戻し進行)と同系統
+
+    function drawChart(canvas, weeks, issue, priceValues, shortMarkers) {
       if (!canvas || !canvas.getContext) return;
       const context = canvas.getContext('2d');
       if (!context) return;
@@ -914,7 +946,8 @@
       context.clearRect(0, 0, cssWidth, cssHeight);
 
       const hasPrice = Array.isArray(priceValues) && priceValues.some(isNumber);
-      const bounds = { left: 58, right: hasPrice ? 56 : 14, top: 14, bottom: 34 };
+      const hasMarkers = Array.isArray(shortMarkers) && shortMarkers.some(function (marker) { return marker; });
+      const bounds = { left: 58, right: hasPrice ? 56 : 14, top: 14, bottom: 34 + (hasMarkers ? 18 : 0) };
       const plotWidth = Math.max(1, cssWidth - bounds.left - bounds.right);
       const plotHeight = Math.max(1, cssHeight - bounds.top - bounds.bottom);
       const values = [];
@@ -1035,12 +1068,26 @@
         }
       }
 
+      if (hasMarkers) {
+        // 日付ラベル行のすぐ上に帯を設け、週位置(xAt)に合わせて▲▽を描く(増分10)
+        const markerY = cssHeight - bounds.bottom + 8;
+        context.font = '13px -apple-system, sans-serif';
+        context.textAlign = 'center';
+        context.textBaseline = 'middle';
+        shortMarkers.forEach(function (marker, index) {
+          if (!marker) return;
+          context.fillStyle = marker.direction === 'up' ? SHORT_MARKER_UP_COLOR : SHORT_MARKER_DOWN_COLOR;
+          context.fillText(marker.direction === 'up' ? '▲' : '▽', xAt(index), markerY);
+        });
+        context.font = '11px -apple-system, sans-serif'; // reviewer指摘B: x軸日付ラベル用のフォントサイズに戻す
+      }
+
       const labelIndexes = weeks.length === 1 ? [0] : [0, Math.floor((weeks.length - 1) / 2), weeks.length - 1];
       context.fillStyle = '#8294a3';
       context.textBaseline = 'top';
       labelIndexes.forEach(function (index, position) {
         context.textAlign = position === 0 ? 'left' : (position === labelIndexes.length - 1 ? 'right' : 'center');
-        context.fillText(shortDate(weeks[index]), xAt(index), cssHeight - bounds.bottom + 10);
+        context.fillText(shortDate(weeks[index]), xAt(index), cssHeight - bounds.bottom + 10 + (hasMarkers ? 18 : 0));
       });
     }
 
@@ -1112,6 +1159,98 @@
       return any ? sum : null;
     }
 
+    // MARKERS(増分10。design.md §6「空売りイベントマーカー」の確定仕様)
+    // 基準日asOfDate以前の、報告者ごとの最新ratioをMapで返す(sumLatestRatioAsOfの内訳版)
+    function reporterLatestRatioMap(events, asOfDate) {
+      const bySeller = Object.create(null);
+      events.forEach(function (event) {
+        if (event.date > asOfDate) return;
+        const current = bySeller[event.seller];
+        if (!current || event.date > current.date) bySeller[event.seller] = event;
+      });
+      const map = Object.create(null);
+      Object.keys(bySeller).forEach(function (seller) {
+        const ratio = bySeller[seller].ratio;
+        if (isNumber(ratio)) map[seller] = ratio;
+      });
+      return map;
+    }
+
+    function sumRatioMap(map) {
+      const keys = Object.keys(map);
+      if (!keys.length) return null;
+      let sum = 0;
+      keys.forEach(function (key) { sum += map[key]; });
+      return sum;
+    }
+
+    // 2時点(thisMap/priorMap)を比べ、変化幅の絶対値が最大の報告者を返す(「主因」)。
+    // 未報告は0扱い(sumRatioMapの合算と同じ扱いに合わせる)
+    function topMoverBetween(thisMap, priorMap) {
+      const sellers = Object.create(null);
+      Object.keys(thisMap).forEach(function (seller) { sellers[seller] = true; });
+      Object.keys(priorMap).forEach(function (seller) { sellers[seller] = true; });
+      let top = null;
+      Object.keys(sellers).forEach(function (seller) {
+        const thisRatio = isNumber(thisMap[seller]) ? thisMap[seller] : 0;
+        const priorRatio = isNumber(priorMap[seller]) ? priorMap[seller] : 0;
+        const deltaPt = (thisRatio - priorRatio) * 100;
+        const absDeltaPt = Math.abs(deltaPt);
+        if (!top || absDeltaPt > top.absDeltaPt) top = { seller: seller, deltaPt: deltaPt, absDeltaPt: absDeltaPt };
+      });
+      return top;
+    }
+
+    // 各週(月〜日、既存mondayKeyOfの流儀)の「週末(日曜)時点の報告者別最新ratio合計」を
+    // 前週末時点と比較する。+0.1pt以上=up(▲橙) / -0.1pt以下=down(▽青) / それ以外・比較不能はnull。
+    // 報告が一度もない銘柄は全週nullになる(帯・明細リストの非表示は呼び出し側でmarkers.some(Boolean)判定)。
+    // 前週末時点に報告が一切ない場合(sumPriorがnull)も比較不能としてnull(0との比較はしない。
+    // computeShortIndicatorの「no-history」と同じ考え方)
+    function computeShortWeekMarkers(events, weeks) {
+      const validEvents = (events || []).filter(function (event) {
+        return event && typeof event.date === 'string' && typeof event.seller === 'string' && isNumber(event.ratio);
+      });
+      return weeks.map(function (week) {
+        const monday = mondayKeyOf(week);
+        if (!monday) return null;
+        const weekEnd = addDaysToYmd(monday, 6); // 週末(日曜)
+        const priorWeekEnd = weekEnd ? addDaysToYmd(weekEnd, -7) : null;
+        if (!weekEnd || !priorWeekEnd) return null;
+        const thisMap = reporterLatestRatioMap(validEvents, weekEnd);
+        const priorMap = reporterLatestRatioMap(validEvents, priorWeekEnd);
+        const sumThis = sumRatioMap(thisMap);
+        const sumPrior = sumRatioMap(priorMap);
+        if (!isNumber(sumThis) || !isNumber(sumPrior)) return null;
+        const deltaPt = (sumThis - sumPrior) * 100;
+        const direction = deltaPt >= SHORT_MARKER_THRESHOLD_PT ? 'up'
+          : (deltaPt <= -SHORT_MARKER_THRESHOLD_PT ? 'down' : null);
+        if (!direction) return null;
+        return {
+          direction: direction,
+          deltaPt: deltaPt,
+          sumThis: sumThis,
+          sumPrior: sumPrior,
+          week: week,
+          topMover: topMoverBetween(thisMap, priorMap)
+        };
+      });
+    }
+
+    function formatSignedPt(pt) {
+      if (!isNumber(pt)) return '—';
+      const rounded = Math.round(pt * 100) / 100;
+      return (rounded >= 0 ? '+' : '') + rounded.toFixed(2) + 'pt';
+    }
+
+    function shortMarkerLineText(marker) {
+      const arrow = marker.direction === 'up' ? '▲' : '▽';
+      let line = shortDate(marker.week) + ' ' + arrow + ' ' + formatShortSumPercent(marker.sumPrior) + '→' + formatShortSumPercent(marker.sumThis);
+      if (marker.topMover) {
+        line += '(主因: ' + marker.topMover.seller + ' ' + formatSignedPt(marker.topMover.deltaPt) + ')';
+      }
+      return line;
+    }
+
     // 指標3: 大口空売り合計ratioの4週前比。報告が一度もなければ中立扱い。
     // 報告はあるが4週(28日)前時点にはまだ報告が無かった(直近に報告が始まったばかり)場合は
     // 'no-history'として区別する。events自体は存在するので根拠行で「報告なし」と誤表示しない。
@@ -1172,9 +1311,9 @@
       }
       let shortPart;
       if (shortIndicator.status === 'ok') {
-        shortPart = formatRatioPercent(shortIndicator.sumPrior) + '→' + formatRatioPercent(shortIndicator.sumLatest) + '(' + shortDirectionWord(shortIndicator.direction) + ')';
+        shortPart = formatShortSumPercent(shortIndicator.sumPrior) + '→' + formatShortSumPercent(shortIndicator.sumLatest) + '(' + shortDirectionWord(shortIndicator.direction) + ')';
       } else if (shortIndicator.status === 'no-history') {
-        shortPart = '現在' + formatRatioPercent(shortIndicator.sumLatest) + '(4週前のデータなし)';
+        shortPart = '現在' + formatShortSumPercent(shortIndicator.sumLatest) + '(4週前のデータなし)';
       } else if (shortIndicator.status === 'error') {
         shortPart = 'データを取得できません';
       } else {
@@ -1343,7 +1482,7 @@
       return '<td class="' + className + '">' + prefix + formatNumber(delta) + '</td>';
     }
 
-    function renderIssueData(code, weeks, issue, prices) {
+    function renderIssueData(code, weeks, issue, prices, shortEvents) {
       const target = document.getElementById('issue-content');
       if (!target) return;
       const latestIndex = weeks.length - 1;
@@ -1381,13 +1520,27 @@
         priceSummaryHtml = '<p class="price-summary">株価未収録（config/price_list.jsonに追加すると収録されます）</p>';
       }
 
+      // 空売りイベントマーカー(増分10)。報告が一度もない銘柄はmarkersが全null→帯・明細とも非表示
+      const shortMarkers = computeShortWeekMarkers(shortEvents || [], weeks);
+      const hasShortMarkers = shortMarkers.some(function (marker) { return marker; });
+      let markerListHtml = '';
+      if (hasShortMarkers) {
+        const recentMarkers = [];
+        shortMarkers.forEach(function (marker) { if (marker) recentMarkers.push(marker); });
+        const recentItems = recentMarkers.slice(-SHORT_MARKER_LIST_LIMIT).reverse(); // 直近優先(新しい順)
+        markerListHtml = '<ul class="short-marker-list" aria-label="大口空売り合計割合の週次変化">' +
+          recentItems.map(function (marker) { return '<li>' + escapeHtml(shortMarkerLineText(marker)) + '</li>'; }).join('') +
+          '</ul>';
+      }
+
       target.innerHTML =
         '<section class="card" aria-labelledby="chart-title">' +
           '<h2 id="chart-title">貸借残高の推移</h2>' +
           '<p class="section-subtitle">週次・単位：株（欠測期間は線を接続しません）</p>' +
           priceSummaryHtml +
           '<ul class="legend" aria-label="系列凡例">' + legendItems.join('') + '</ul>' +
-          '<div class="chart-wrap"><canvas id="series-chart" role="img" aria-label="' + escapeHtml(code) + 'の貸借残高時系列チャート' + (hasPriceValues ? '（株価重ね描き付き）' : '') + '">時系列チャート</canvas></div>' +
+          markerListHtml +
+          '<div class="chart-wrap"><canvas id="series-chart" role="img" aria-label="' + escapeHtml(code) + 'の貸借残高時系列チャート' + (hasPriceValues ? '（株価重ね描き付き）' : '') + (hasShortMarkers ? '（大口空売りイベントマーカー付き）' : '') + '">時系列チャート</canvas></div>' +
         '</section>' +
         '<section class="card" aria-labelledby="delta-title">' +
           '<h2 id="delta-title">最新週と前週の比較</h2>' +
@@ -1401,11 +1554,11 @@
           '<p>JSDAは制度貸借を除く一般貸借。貸付残高は転貸ダブルカウントの可能性があり、借株需要の代理変数として見る</p>' +
         '</details>';
 
-      state.currentChart = { weeks: weeks, issue: issue, priceValues: priceValues };
+      state.currentChart = { weeks: weeks, issue: issue, priceValues: priceValues, shortMarkers: shortMarkers };
       // innerHTML代入直後でもgetBoundingClientRectが同期レイアウトを強制するため
       // 直接描画できる。rAF待ちにすると非表示タブ(iOS PWAのバックグラウンド復帰等)で
       // コールバックが発火せずチャートが空のままになる(2026-07-22実測)
-      drawChart(document.getElementById('series-chart'), weeks, issue, priceValues);
+      drawChart(document.getElementById('series-chart'), weeks, issue, priceValues, shortMarkers);
     }
 
     function renderSignalCard(target, weeks, issue, events, shortFetchFailed, prices) {
@@ -1425,8 +1578,10 @@
           '<details class="detail-note"><summary>このシグナルの見方(かんたん解説)</summary>' +
             '<p>・「借株」とは: 機関投資家が空売り(株を借りて売り、値下がり後に買い戻して返す取引)のために借りている株のことです。借株が増える=空売りの準備が進んでいる、減る=買い戻しが進んでいる、と読めます。</p>' +
             '<p>・「大口空売り」とは: 発行済株式の0.5%以上を空売りすると、機関名の公表が義務付けられています。誰がどれだけ売っているかが見えます。</p>' +
+            '<p>・報告が「0.5%未満に低下」となった場合、その機関の空売りが基準未満まで減った(買い戻しが進んだ)ことを意味します。</p>' +
             '<p>・注意: 貸し借りの集計には又貸し分の二重計上がありえるため、残高の絶対値より「増えているか減っているか」を見るのがコツです。</p>' +
             '<p>・この判定は決まった計算式(閾値: 借株残4週±10%、空売り残高4週±0.5ポイント)による機械的な参考情報です。</p>' +
+            '<p>・チャート下の▲▽は、大口空売りの合計割合がその週に増えた(▲)/減った(▽)ことを示します。</p>' +
             '<p>もっと詳しく知りたいときは<a class="guide-link-inline" href="#/guide">用語・見方ガイド</a>もご覧ください。</p>' +
           '</details>' +
         '</section>';
@@ -1467,8 +1622,18 @@
         if (!issue) throw new Error('この銘柄の時系列データがありません。');
         let prices = null;
         try { prices = await pricesPromise; } catch (priceError) { prices = null; }
+        // 空売りイベントマーカー(増分10)用。既にfetch済みのshortShardPromiseを再利用するので
+        // 追加fetchは発生しない。取得失敗時はマーカーなし(帯非表示)にフォールバック
+        let shortEvents = [];
+        try {
+          const shard = await shortShardPromise;
+          const shortIssue = shard && shard.issues ? shard.issues[code] : null;
+          shortEvents = (shortIssue && Array.isArray(shortIssue.events)) ? shortIssue.events : [];
+        } catch (shortError) {
+          shortEvents = [];
+        }
         if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
-        renderIssueData(code, payload.weeks, issue, prices);
+        renderIssueData(code, payload.weeks, issue, prices, shortEvents);
       } catch (error) {
         if (requestId !== state.routeRequest) return;
         const target = document.getElementById('issue-content');
@@ -1820,7 +1985,7 @@
       state.resizeFrame = window.requestAnimationFrame(function () {
         state.resizeFrame = 0;
         const chart = document.getElementById('series-chart');
-        if (chart && state.currentChart) drawChart(chart, state.currentChart.weeks, state.currentChart.issue, state.currentChart.priceValues);
+        if (chart && state.currentChart) drawChart(chart, state.currentChart.weeks, state.currentChart.issue, state.currentChart.priceValues, state.currentChart.shortMarkers);
       });
     }
 
