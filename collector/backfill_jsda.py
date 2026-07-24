@@ -8,7 +8,7 @@ holiday-shifted report dates never have to be guessed.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from html.parser import HTMLParser
 import json
@@ -42,6 +42,12 @@ _Z_FILENAME = re.compile(
     r"^(?P<day>\d{8})z(?:\((?P<revision>\d{8})r\))?\.(?:xls|xlsx)$",
     re.IGNORECASE,
 )
+# 増分11.5: s(新規成約高)は半期zipにzと同梱されている(2026-07-24実測、design.md
+# §2)。命名規則・訂正版括弧書きはzと同一パターンでkind文字だけが異なる
+_S_FILENAME = re.compile(
+    r"^(?P<day>\d{8})s(?:\((?P<revision>\d{8})r\))?\.(?:xls|xlsx)$",
+    re.IGNORECASE,
+)
 
 
 class BackfillError(RuntimeError):
@@ -69,6 +75,14 @@ class WeeklyCandidate:
 class BackfillResult:
     processed_weeks: list[str]
     failures: list[str]
+    # 増分11.5: sが見つからずbuild_z_weekly(shinki空)にフォールバックした週。
+    # フェイルラウドにはしない(sの欠落自体はfailuresへ入れない)ので、進捗可視化
+    # 用に別枠で数える。デフォルト空リストで既存呼び出しに影響しない
+    s_missing_weeks: list[str] = field(default_factory=list)
+    # sの抽出・取得を試みて失敗した際の非致命的な理由(診断用、exit_codeには
+    # 影響しない)。s_missing_weeksとの違い: こちらは「なぜ拾えなかったか」の
+    # ログで、選外(意図的にs無し)と取得失敗の両方を含みうる
+    s_notices: list[str] = field(default_factory=list)
 
     @property
     def exit_code(self) -> int:
@@ -189,6 +203,51 @@ def select_preferred_z_names(filenames: Iterable[str]) -> dict[date, ZName]:
     return selected
 
 
+def parse_s_name(filename: str) -> ZName | None:
+    """Parse a plain/revised s filename; return None for j/z/unrelated files.
+
+    増分11.5: zとまったく同じ形の revision-aware ファイル名なので ``ZName`` を
+    そのまま再利用する(sを表す専用フィールド名は付けない=歴史的な"zname"の
+    まま、s向けの呼び出し側では変数名で区別する)。
+    """
+    basename = Path(filename).name
+    match = _S_FILENAME.fullmatch(basename)
+    if match is None:
+        return None
+    raw_day = match.group("day")
+    try:
+        report_date = date(
+            int(raw_day[:4]), int(raw_day[4:6]), int(raw_day[6:8])
+        )
+    except ValueError as exc:
+        raise BackfillError(f"sファイル名の日付が不正です: {basename}") from exc
+    revision = match.group("revision")
+    if revision is not None:
+        try:
+            date(int(revision[:4]), int(revision[4:6]), int(revision[6:8]))
+        except ValueError as exc:
+            raise BackfillError(f"訂正日が不正です: {basename}") from exc
+    return ZName(basename, report_date, revision)
+
+
+def select_preferred_s_names(filenames: Iterable[str]) -> dict[date, ZName]:
+    """Select the newest revised s file for each report week (訂正版優先)."""
+    selected: dict[date, ZName] = {}
+    for filename in sorted(filenames):
+        candidate = parse_s_name(filename)
+        if candidate is None:
+            continue
+        current = selected.get(candidate.report_date)
+        if current is None or candidate.priority > current.priority:
+            selected[candidate.report_date] = candidate
+        elif candidate.priority == current.priority and candidate.filename != current.filename:
+            raise BackfillError(
+                f"同一優先度のsファイルが複数あります: "
+                f"{current.filename}, {candidate.filename}"
+            )
+    return selected
+
+
 def discover_z_urls(index_html: str, index_url: str = INDEX_URL) -> dict[date, str]:
     """Discover and revision-resolve z links from the JSDA index HTML."""
     parser = _HrefParser()
@@ -205,6 +264,29 @@ def discover_z_urls(index_html: str, index_url: str = INDEX_URL) -> dict[date, s
             urls_by_name[filename] = absolute
     preferred = select_preferred_z_names(urls_by_name)
     return {day: urls_by_name[zname.filename] for day, zname in preferred.items()}
+
+
+def discover_s_urls(index_html: str, index_url: str = INDEX_URL) -> dict[date, str]:
+    """Discover and revision-resolve s links from the JSDA index HTML.
+
+    増分11.5: 現行半期のindexページはzと同じ並びでsもリンクしている
+    (2026-07-24実測)。sはあくまで任意扱いなので、呼び出し側は見つからなくても
+    フェイルラウドしない。
+    """
+    parser = _HrefParser()
+    parser.feed(index_html)
+    index_host = urlparse(index_url).netloc
+    urls_by_name: dict[str, str] = {}
+    for href in parser.hrefs:
+        absolute = urljoin(index_url, href)
+        parsed = urlparse(absolute)
+        if parsed.netloc != index_host:
+            continue
+        filename = Path(unquote(parsed.path)).name
+        if parse_s_name(filename) is not None:
+            urls_by_name[filename] = absolute
+    preferred = select_preferred_s_names(urls_by_name)
+    return {day: urls_by_name[sname.filename] for day, sname in preferred.items()}
 
 
 def _half_start(day: date) -> date:
@@ -259,6 +341,19 @@ def _extract_archive_candidates(
         raise BackfillError(f"zipを展開できません: {archive_path}") from exc
 
 
+def _extract_archive_s_candidates(
+    archive_path: Path,
+    extract_root: Path,
+    start: date,
+    end: date,
+) -> tuple[list[WeeklyCandidate], list[str]]:
+    """Best-effort extraction of s(新規成約高) files from the same half-year zip.
+
+    増分11.5: 構造は_extract_archive_candidates(z)と同一だが、sはzと違い必須では
+    ない。zipファイル自体が開けない(BadZipFile等)場合はここで例外を送出し、
+    呼び出し側(run_backfill)がアーカイブ単位でs_noticesへ記録する。
+
+    reviewer指摘A(2026-07-24)対応: メンバー単位の抽出(archive.open→copyfileobj)は
 def _merge_candidates(candidates: Iterable[WeeklyCandidate]) -> dict[date, WeeklyCandidate]:
     selected: dict[date, WeeklyCandidate] = {}
     for candidate in candidates:
@@ -378,11 +473,6 @@ def run_backfill(
             week_text = report_date.isoformat()
             destination = weekly_dir / f"{week_text}.json"
             try:
-                document = jsda_weekly.build_z_weekly(
-                    candidate.path,
-                    week_text,
-                    min_issue_count=minimum,
-                )
                 _write_weekly(destination, document)
                 processed.append(week_text)
             except Exception as exc:
@@ -400,7 +490,6 @@ def run_backfill(
             build_site.build_site(weekly_dir, output_root, _generated_at())
         except Exception as exc:
             failures.append(f"build_site: {exc}")
-    return BackfillResult(processed, failures)
 
 
 def _parse_cli_date(value: str, label: str) -> date:
