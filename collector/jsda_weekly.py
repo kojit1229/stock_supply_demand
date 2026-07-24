@@ -380,8 +380,15 @@ def build_weekly(
     z_path: str | os.PathLike[str],
     s_path: str | os.PathLike[str],
     report_date: str,
+    *,
+    min_issue_count: int = 1,
 ) -> dict[str, Any]:
-    """Build the complete ``supply_demand_weekly_v1`` JSON-compatible object."""
+    """Build the complete ``supply_demand_weekly_v1`` JSON-compatible object.
+
+    ``min_issue_count`` only gates the z(貸借残高)側(build_z_weeklyと同じ意味の
+    下限)。s(新規成約高)は元々z全銘柄より少ない母数が正常(下記コメント)なので、
+    同じ下限を課さずparse_shinki側は既定の1のままにする(増分11.5)。
+    """
     try:
         parsed_date = date.fromisoformat(report_date)
     except ValueError as exc:
@@ -391,7 +398,7 @@ def build_weekly(
 
     _validate_source_filename(z_path, "z", report_date)
     _validate_source_filename(s_path, "s", report_date)
-    zandaka = parse_zandaka(z_path)
+    zandaka = parse_zandaka(z_path, min_issue_count=min_issue_count)
     # s(新規成約高)は当該週に成約があった銘柄のみ収録される(実測: z=4,330銘柄
     # に対しs=約3,960銘柄)。z/sの銘柄集合は一致しないのが正常で、欠けた側は
     # 空オブジェクトのまま和集合で出力する(仕様)
