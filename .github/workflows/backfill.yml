@@ -40,6 +40,14 @@ jobs:
             fi
           fi
 
+      - name: Restore JSDA download cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data/_cache
+          key: jsda-dl-cache-${{ github.run_id }}
+          restore-keys: |
+            jsda-dl-cache-
+
       - name: Rebuild 3-year weekly history from JSDA archives (z+s)
         shell: bash
         env:
@@ -47,6 +55,13 @@ jobs:
         run: |
           set -euo pipefail
           python collector/backfill_jsda.py --out data --cache-dir data/_cache
+
+      - name: Save JSDA download cache (also on failure, so reruns converge)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/_cache
+          key: jsda-dl-cache-${{ github.run_id }}
 
       - name: Deploy one orphan commit to gh-pages
         shell: bash
