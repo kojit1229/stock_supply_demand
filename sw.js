@@ -1,6 +1,6 @@
 'use strict';
 
-const CACHE_NAME = 'jukyu-v6';
+const CACHE_NAME = 'jukyu-v7';
 const APP_SHELL = ['./', './index.html', './manifest.json'];
 
 self.addEventListener('install', function (event) {
