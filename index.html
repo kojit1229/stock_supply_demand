@@ -249,6 +249,19 @@
     .flow-chart-wrap { position: relative; width: 100%; height: 120px; }
     .flow-chart-wrap canvas { display: block; width: 100%; height: 120px; }
 
+    .taishaku-metrics { display: flex; flex-wrap: wrap; gap: 18px; margin: 4px 0 14px; }
+    .taishaku-metric { display: flex; flex-direction: column; gap: 2px; }
+    .taishaku-metric-label { color: var(--muted); font-size: .74rem; }
+    .taishaku-metric-value { font-size: 1.25rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .taishaku-metric-delta { font-size: .78rem; font-variant-numeric: tabular-nums; }
+    .taishaku-flow-table { margin-bottom: 14px; }
+    .taishaku-flow-table table { width: auto; font-size: .84rem; }
+    .taishaku-flow-table td { padding: 5px 14px 5px 0; border-bottom: 0; text-align: left; white-space: nowrap; }
+    .taishaku-flow-table td:first-child { color: var(--muted); }
+    /* 独立クラス方式(増分11後半reviewer指摘Aと同じ理由): .chart-wrapを継承せずheightを明示固定する */
+    .taishaku-chart-wrap { position: relative; width: 100%; height: 100px; margin-bottom: 4px; }
+    .taishaku-chart-wrap canvas { display: block; width: 100%; height: 100px; }
+
     .chart-wrap { position: relative; width: 100%; min-height: 320px; }
     #series-chart { display: block; width: 100%; height: 320px; }
 
@@ -459,7 +472,8 @@
       series: function (shard) { return 'data/series/' + shard + '.json'; },
       short: function (shard) { return 'data/short/' + shard + '.json'; },
       shortMeta: 'data/short_meta.json',
-      prices: function (code) { return 'data/prices/' + code + '.json'; }
+      prices: function (code) { return 'data/prices/' + code + '.json'; },
+      taishakuSeries: function (shard) { return 'data/taishaku_series/' + shard + '.json'; }
     });
     const SHORT_HISTORY_LIMIT = 20;
     const SERIES = Object.freeze([
@@ -613,9 +627,11 @@
       seriesCache: new Map(),
       shortCache: new Map(),
       pricesCache: new Map(),
+      taishakuCache: new Map(),
       shortMeta: null,
       shortMetaFetched: false,
       currentChart: null,
+      currentTaishakuChart: null,
       routeRequest: 0,
       resizeFrame: 0
     };
@@ -823,6 +839,26 @@
       return payload;
     }
 
+    // 増分14b: 日証金(制度信用)カード用データ。404・shardにコードなし・fetch失敗は
+    // すべて「カード非表示」に倒す(日証金レーンは収集開始直後でデータが薄いため、
+    // エラー表示は出さない設計)。404はnullを返し、それ以外の失敗は呼び出し側にthrowする
+    async function loadTaishakuSeries(shard) {
+      if (!/^[A-Za-z0-9_-]+$/.test(shard)) throw new Error('shard名が不正です。');
+      if (state.taishakuCache.has(shard)) return state.taishakuCache.get(shard);
+      const response = await fetch(DATA_PATHS.taishakuSeries(shard), { headers: { Accept: 'application/json' } });
+      if (response.status === 404) {
+        state.taishakuCache.set(shard, null);
+        return null;
+      }
+      if (!response.ok) throw new Error('日証金データの取得に失敗しました (' + response.status + ')');
+      const payload = await response.json();
+      if (!payload || !Array.isArray(payload.dates) || !payload.issues || typeof payload.issues !== 'object') {
+        throw new Error('日証金データの形式が不正です。');
+      }
+      state.taishakuCache.set(shard, payload);
+      return payload;
+    }
+
     // JSDA週(weeks配列。金曜、祝日週は木曜)に、株価週足(月曜起点)を同じ週(月〜日)で対応させる。
     // 対応する週の終値が無ければnull(チャートはギャップとして線を切る)。
     function buildPriceWeekMap(prices) {
@@ -952,6 +988,109 @@
       }
     }
 
+    // TAISHAKU(日証金・制度信用カード。増分14b。design.md §6「日証金カード」)
+    const TAISHAKU_CHART_MIN_DATES = 5; // これ未満(非null日数)なら小チャートを出さない
+
+    // 前日値が非nullの場合のみ差分文字列を返す(nullなら前日比自体を出さない=呼び出し側でnullチェック)
+    function formatSignedDelta(current, previous) {
+      if (!isNumber(current) || !isNumber(previous)) return null;
+      const delta = current - previous;
+      const prefix = delta > 0 ? '+' : '';
+      return prefix + formatNumber(delta);
+    }
+
+    function taishakuDeltaClass(current, previous) {
+      if (!isNumber(current) || !isNumber(previous)) return '';
+      const delta = current - previous;
+      return delta > 0 ? 'delta-up' : (delta < 0 ? 'delta-down' : 'delta-flat');
+    }
+
+    function taishakuMetricHtml(label, value, previous) {
+      const deltaText = formatSignedDelta(value, previous);
+      const deltaHtml = deltaText ? '<span class="taishaku-metric-delta ' + taishakuDeltaClass(value, previous) + '">前日比 ' + escapeHtml(deltaText) + '</span>' : '';
+      return '<div class="taishaku-metric">' +
+        '<span class="taishaku-metric-label">' + escapeHtml(label) + '</span>' +
+        '<span class="taishaku-metric-value">' + formatNumber(value) + '</span>' +
+        deltaHtml +
+      '</div>';
+    }
+
+    function renderTaishakuCard(target, code, dates, issueData) {
+      const yushiZan = Array.isArray(issueData.yushi_zan) ? issueData.yushi_zan : [];
+      const kashikabuZan = Array.isArray(issueData.kashikabu_zan) ? issueData.kashikabu_zan : [];
+      const sashihikiZan = Array.isArray(issueData.sashihiki_zan) ? issueData.sashihiki_zan : [];
+      const yushiShin = Array.isArray(issueData.yushi_shin) ? issueData.yushi_shin : [];
+      const yushiHen = Array.isArray(issueData.yushi_hen) ? issueData.yushi_hen : [];
+      const kashikabuShin = Array.isArray(issueData.kashikabu_shin) ? issueData.kashikabu_shin : [];
+      const kashikabuHen = Array.isArray(issueData.kashikabu_hen) ? issueData.kashikabu_hen : [];
+
+      const latestIndex = dates.length - 1;
+      const previousIndex = latestIndex - 1;
+      if (latestIndex < 0) { target.innerHTML = ''; return; } // dates空はカード非表示(仕様の「銘柄未収録」相当)
+      const latestDate = dates[latestIndex];
+
+      const latestYushi = yushiZan[latestIndex];
+      const latestKashikabu = kashikabuZan[latestIndex];
+      const latestSashihiki = sashihikiZan[latestIndex];
+      const prevYushi = previousIndex >= 0 ? yushiZan[previousIndex] : null;
+      const prevKashikabu = previousIndex >= 0 ? kashikabuZan[previousIndex] : null;
+      const prevSashihiki = previousIndex >= 0 ? sashihikiZan[previousIndex] : null;
+
+      const metricsHtml = taishakuMetricHtml('融資残（買い方）', latestYushi, prevYushi) +
+        taishakuMetricHtml('貸株残（売り方）', latestKashikabu, prevKashikabu) +
+        taishakuMetricHtml('差引', latestSashihiki, prevSashihiki);
+
+      const flowTableHtml =
+        '<div class="taishaku-flow-table">' +
+          '<p class="section-subtitle">当日のフロー（新規／返済）</p>' +
+          '<table>' +
+            '<tbody>' +
+              '<tr><td>融資</td><td>新規 ' + formatNumber(yushiShin[latestIndex]) + '</td><td>返済 ' + formatNumber(yushiHen[latestIndex]) + '</td></tr>' +
+              '<tr><td>貸株</td><td>新規 ' + formatNumber(kashikabuShin[latestIndex]) + '</td><td>返済 ' + formatNumber(kashikabuHen[latestIndex]) + '</td></tr>' +
+            '</tbody>' +
+          '</table>' +
+        '</div>';
+
+      const validDateCount = dates.filter(function (_, index) {
+        return isNumber(yushiZan[index]) || isNumber(kashikabuZan[index]);
+      }).length;
+      const hasChart = validDateCount >= TAISHAKU_CHART_MIN_DATES;
+      const chartHtml = hasChart
+        ? '<div class="taishaku-chart-wrap"><canvas id="taishaku-chart" role="img" aria-label="' + escapeHtml(code) + 'の日証金融資残・貸株残の推移">日証金推移チャート</canvas></div>'
+        : '';
+
+      target.innerHTML =
+        '<section class="card" aria-labelledby="taishaku-title">' +
+          '<h2 id="taishaku-title">日証金（制度信用）の貸借</h2>' +
+          '<p class="section-subtitle">最新日: ' + escapeHtml(latestDate) + '</p>' +
+          '<div class="taishaku-metrics">' + metricsHtml + '</div>' +
+          flowTableHtml +
+          chartHtml +
+          '<span class="confidence-tag">制度信用(日証金)のみ・東証銘柄</span>' +
+          '<p class="note">日証金(証券金融会社)を通じた制度信用取引の残高です。制度信用は主に個人投資家が使うため、上の貸借残高(機関側)と見比べると『機関と個人がそれぞれどちらに傾いているか』の目安になります。融資残=信用買いの残、貸株残=信用売りの残です。</p>' +
+        '</section>';
+
+      if (hasChart) {
+        state.currentTaishakuChart = { dates: dates, yushiZan: yushiZan, kashikabuZan: kashikabuZan };
+        drawTaishakuChart(document.getElementById('taishaku-chart'), dates, yushiZan, kashikabuZan);
+      } else {
+        state.currentTaishakuChart = null;
+      }
+    }
+
+    async function renderTaishakuSection(code, requestId, taishakuPromise) {
+      const target = document.getElementById('taishaku-content');
+      if (!target) return;
+      try {
+        const payload = await taishakuPromise;
+        if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
+        // 404(未収録)・shardにコードなしは、どちらもエラー表示を出さずカードごと非表示にする
+        // (日証金レーンは収集開始直後でデータが薄く、未収録は珍しくないため)
+        const issueData = payload && payload.issues ? payload.issues[code] : null;
+        if (!payload || !issueData) {
+          target.innerHTML = '';
+          state.currentTaishakuChart = null;
+          return;
     // CHART
     const SHORT_MARKER_UP_COLOR = '#F0B34C'; // badge-orange(積み上がり)と同系統
     const SHORT_MARKER_DOWN_COLOR = '#73A9DF'; // badge-blue(買い戻し進行)と同系統
@@ -1757,7 +1896,6 @@
         '</div>' +
         '<div id="signal-content"><div class="card status-card">需給シグナルを計算しています…</div></div>' +
         '<div id="issue-content"><div class="card status-card">時系列データを読み込んでいます…</div></div>' +
-        '<div id="short-content"><div class="card status-card">空売り報告を読み込んでいます…</div></div>';
 
       const requestId = ++state.routeRequest;
       const seriesPromise = loadSeries(info.shard);
@@ -2073,7 +2211,6 @@
               '<tr><td>借株残(かりかぶざん)</td><td>借りたまま返していない株の残高。このアプリの需給シグナルの主な材料です。</td></tr>' +
               '<tr><td>逆日歩(ぎゃくひぶ)</td><td>品貸料とも呼ばれる、株を借りるための追加コストのこと。借りたい人が多く株が不足すると発生します。</td></tr>' +
               '<tr><td>需給(じゅきゅう)</td><td>「買いたい人」と「売りたい人」のバランスのこと。需要(買い)と供給(売り)を合わせた言葉です。</td></tr>' +
-              '<tr><td>制度信用取引と一般信用取引</td><td>取引所が定めたルールに沿う「制度信用」と、証券会社が個別に条件を決める「一般信用」の2種類。このアプリのJSDAデータは制度信用を含まない「一般貸借」が対象です。</td></tr>' +
               '<tr><td>貸借取引(たいしゃくとりひき)</td><td>株や資金を貸し借りする取引全般のこと。このアプリでは主にJSDAが集計する一般貸借を指します。</td></tr>' +
               '<tr><td>転貸(てんたい)</td><td>借りた株をさらに他社に貸すこと(又貸し)。集計上、同じ株が二重に数えられる原因になります。</td></tr>' +
               '<tr><td>踏み上げ(ふみあげ)</td><td>ショートスクイーズとも呼ばれます。空売りをしていた投資家が株価上昇で買い戻さざるを得なくなり、それがさらに株価上昇を加速させる現象です。</td></tr>' +
@@ -2134,7 +2271,6 @@
     }
 
     function handleResize() {
-      if (!state.currentChart || state.resizeFrame) return;
       state.resizeFrame = window.requestAnimationFrame(function () {
         state.resizeFrame = 0;
         const chart = document.getElementById('series-chart');
