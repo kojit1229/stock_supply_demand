@@ -317,8 +317,39 @@ def parse_short_workbook(
         workbook.release_resources()
 
 
+_EVENT_KEYS = {"date", "ratio", "qty", "seller"}
+_BELOW_THRESHOLD_EVENT_KEYS = _EVENT_KEYS | {"below_threshold"}
+
+
 def _validate_event(event: Any, code: str) -> dict[str, Any]:
-    if not isinstance(event, dict) or set(event) != {"date", "ratio", "qty", "seller"}:
+    if not isinstance(event, dict):
+        raise JPXShortError(f"invalid existing event for {code}: {event!r}")
+    keys = set(event)
+    if keys == _BELOW_THRESHOLD_EVENT_KEYS:
+        # 増分10.5: 報告終了(合成)イベント。design.md §4のとおりratio=0.0/qty=null
+        # 固定で、below_thresholdは追加フィールドとして既存4キーのイベントとは
+        # 別枠で扱う(通常イベントの構造は変えない)
+        if event.get("below_threshold") is not True:
+            raise JPXShortError(f"invalid below_threshold flag for {code}: {event!r}")
+        event_date = _parse_iso_date(event.get("date"), f"event date for {code}")
+        seller = _normalize_text(event.get("seller"), f"event seller for {code}")
+        if event.get("qty") is not None:
+            raise JPXShortError(
+                f"below_threshold event must have qty=null for {code}: {event!r}"
+            )
+        ratio = _ratio(event.get("ratio"), 0)
+        if ratio != 0.0:
+            raise JPXShortError(
+                f"below_threshold event must have ratio=0.0 for {code}: {event!r}"
+            )
+        return {
+            "date": event_date,
+            "ratio": 0.0,
+            "qty": None,
+            "seller": seller,
+            "below_threshold": True,
+        }
+    if keys != _EVENT_KEYS:
         raise JPXShortError(f"invalid existing event for {code}: {event!r}")
     event_date = _parse_iso_date(event.get("date"), f"event date for {code}")
     seller = _normalize_text(event.get("seller"), f"event seller for {code}")
@@ -395,6 +426,55 @@ def _merge_issues(
         current["events"] = sorted(
             by_key.values(), key=lambda event: (event["date"], event["seller"])
         )
+
+
+def _synthesize_report_endings(
+    destination: dict[str, dict[str, Any]],
+    source: dict[str, dict[str, Any]],
+    publication_date: date,
+) -> dict[str, dict[str, Any]]:
+    """Return synthetic below_threshold events for sellers absent from source.
+
+    増分10.5(design.md §4「報告終了イベント」): JPX日次ファイルは報告中全
+    ポジションのスナップショットなので、``destination``(この日を取り込む直前の
+    累積状態)である銘柄・報告者の最新イベントが有効(below_threshold未設定)な
+    のに、当日の``source``スナップショットにその銘柄・報告者が一切現れなければ
+    0.5%未満へ低下したとみなし、合成イベントを返す。呼び出し側が
+    ``_merge_issues`` で取り込む。
+
+    冪等性: 最新イベントが既にbelow_thresholdなら再合成しない。再登場した
+    報告者(sourceに現れる)は対象外(通常イベントの取り込みに任せる)。銘柄
+    自体がsourceに存在しない場合も、その銘柄の全報告者が同様に扱われる
+    (source.get(code, {})が空になり全員「不在」判定になるため)。
+    """
+    publication_iso = publication_date.isoformat()
+    endings: dict[str, dict[str, Any]] = {}
+    for code, issue in destination.items():
+        source_sellers = {
+            event["seller"] for event in source.get(code, {}).get("events", ())
+        }
+        latest_by_seller: dict[str, dict[str, Any]] = {}
+        for event in issue["events"]:
+            seller = event["seller"]
+            current_latest = latest_by_seller.get(seller)
+            if current_latest is None or event["date"] > current_latest["date"]:
+                latest_by_seller[seller] = event
+        for seller, latest in sorted(latest_by_seller.items()):
+            if latest.get("below_threshold"):
+                continue  # 既に報告終了済み: 再合成しない(冪等)
+            if seller in source_sellers:
+                continue  # 当日も報告あり: 通常の取り込みに任せる
+            endings.setdefault(code, {"name": issue["name"], "events": []})
+            endings[code]["events"].append(
+                {
+                    "date": publication_iso,
+                    "ratio": 0.0,
+                    "qty": None,
+                    "seller": seller,
+                    "below_threshold": True,
+                }
+            )
+    return endings
 
 
 def _assemble_outputs(
@@ -535,8 +615,16 @@ def run_update(
         source = fetcher.fetch(url, cache_root / filename)
         parsed_snapshots.append((publication_date, parse_short_workbook(source)))
 
-    for _, snapshot in parsed_snapshots:
+    for publication_date, snapshot in parsed_snapshots:
+        # 増分10.5: 合成(below_threshold)は「取得・パースに成功した日」だけが
+        # ここへ到達する(fetch/parseの失敗は上のループで例外となり、この時点の
+        # existingは書き出されない=取得失敗日には合成しない)。日ごとに
+        # 取り込み→合成の順で処理し、複数日をまとめて処理する場合でも
+        # 前日までの合成結果を踏まえて次の日の判定を行う
         _merge_issues(existing, snapshot)
+        endings = _synthesize_report_endings(existing, snapshot, publication_date)
+        if endings:
+            _merge_issues(existing, endings)
     latest_processed = parsed_snapshots[-1][0]
     timestamp = generated_at or _generated_at()
     _validate_generated_at(timestamp)
