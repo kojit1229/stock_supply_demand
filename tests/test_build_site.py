@@ -62,16 +62,29 @@ class BuildSiteTests(unittest.TestCase):
             shard = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(shard["weeks"], dates)
             for issue in shard["issues"].values():
-                for field in ("lend_qty", "own_qty", "ten_qty", "lend_amt"):
+                # 増分11: 既存z系列(4項目)+新規s系列(2項目)いずれも配列長は
+                # weeksと一致しなければならない
+                for field in (
+                    "lend_qty", "own_qty", "ten_qty", "lend_amt",
+                    "s_borrow_qty", "s_lend_qty",
+                ):
                     self.assertEqual(len(issue[field]), len(dates))
 
         shard_28 = self._read_output("series/28.json")
         kioxia = shard_28["issues"]["285A"]
         expected_lend_qty = 9_215_104 + 1_393_235
         self.assertEqual(kioxia["lend_qty"], [expected_lend_qty] * len(dates))
+        # 増分11回帰なし確認: 既存z系列は上記のとおり不変。s系列は同フィクスチャの
+        # shinki生値(yutanpo+mutanpo)から独立に算出される
+        expected_s_lend_qty = 5_316_474 + 576_263
+        expected_s_borrow_qty = (267_266 + 0) + (2_190_256 + 662_946)
+        self.assertEqual(kioxia["s_lend_qty"], [expected_s_lend_qty] * len(dates))
+        self.assertEqual(kioxia["s_borrow_qty"], [expected_s_borrow_qty] * len(dates))
 
         shard_13 = self._read_output("series/13.json")
         self.assertEqual(shard_13["issues"]["1301"]["lend_qty"][1], None)
+        self.assertEqual(shard_13["issues"]["1301"]["s_lend_qty"][1], None)
+        self.assertEqual(shard_13["issues"]["1301"]["s_borrow_qty"][1], None)
 
         issues = self._read_output("issues.json")
         self.assertEqual(issues["issues"]["285A"]["name"], "キオクシアホールディングス")
@@ -80,6 +93,52 @@ class BuildSiteTests(unittest.TestCase):
         self.assertEqual(meta["latest_week"], dates[-1])
         self.assertEqual(meta["weekly_count"], len(dates))
         self.assertEqual(meta["generated_at"], GENERATED_AT)
+
+    def test_shinki_present_issue_sums_borrow_and_lend_across_collateral(self):
+        # 増分11: 285Aはyutanpo+mutanpoの両方にshinkiがある(design.md §4の規則:
+        # s_lend_qty=貸付新規、s_borrow_qty=借入自己+転貸、いずれも有担保+無担保合算)
+        self._write_week("2026-07-10")
+        build_site.build_site(self.weekly_dir, self.out_dir, GENERATED_AT)
+        kioxia = self._read_output("series/28.json")["issues"]["285A"]
+        self.assertEqual(kioxia["s_lend_qty"], [5_316_474 + 576_263])
+        self.assertEqual(
+            kioxia["s_borrow_qty"], [(267_266 + 0) + (2_190_256 + 662_946)]
+        )
+
+    def test_shinki_single_collateral_issue_sums_available_side(self):
+        # 2560はフィクスチャ上yutanpoのみ(mutanpo不在)。z側の
+        # test_single_collateral_week_sums_available_sideと対になる、s側の検証
+        self._write_week("2026-07-10")
+        build_site.build_site(self.weekly_dir, self.out_dir, GENERATED_AT)
+        shard = self._read_output("series/25.json")
+        issue = shard["issues"]["2560"]
+        self.assertEqual(issue["s_lend_qty"], [20])
+        self.assertEqual(issue["s_borrow_qty"], [0 + 10])
+
+    def test_shinki_missing_for_issue_yields_null_series_values(self):
+        # その週にshinki(s)が全く収録されなかった銘柄(design.md §4「両方nullなら
+        # null」)。実運用でも起こりうる形(z側は正常にあるがshinkiだけ空)
+        def clear_shinki(document):
+            document["issues"]["1301"]["shinki"] = {}
+
+        self._write_week("2026-07-10", clear_shinki)
+        build_site.build_site(self.weekly_dir, self.out_dir, GENERATED_AT)
+        issue = self._read_output("series/13.json")["issues"]["1301"]
+        self.assertIsNone(issue["s_lend_qty"][0])
+        self.assertIsNone(issue["s_borrow_qty"][0])
+        # z側(taishaku)は影響を受けない(shinkiの欠測とtaishakuは無関係)
+        self.assertIsNotNone(issue["lend_qty"][0])
+
+    def test_shinki_invalid_measurement_fails_loudly(self):
+        # 増分11で新たにshinkiの内部構造も検証対象になったため、taishaku同様に
+        # フェイルラウドすることを確認する(design.md/CLAUDE.mdルール1)
+        def corrupt_shinki(document):
+            document["issues"]["285A"]["shinki"]["yutanpo"]["own_qty"] = "not-an-int"
+
+        self._write_week("2026-07-10", corrupt_shinki)
+        with self.assertRaisesRegex(build_site.BuildSiteError, "shinki.yutanpo.own_qty"):
+            build_site.build_site(self.weekly_dir, self.out_dir, GENERATED_AT)
+        self.assertFalse(self.out_dir.exists())
 
     def test_duplicate_week_raises_without_writing_output(self):
         self._write_week("2026-07-10")
