@@ -71,6 +71,16 @@ class JPXShortTests(unittest.TestCase):
         )
         return out, cache, downloader, updated
 
+    def _seed_shard(self, out, shard, issues):
+        (out / "short").mkdir(parents=True, exist_ok=True)
+        (out / "short" / f"{shard}.json").write_text(
+            json.dumps(
+                {"schema_version": jpx_short.SHORT_SCHEMA_VERSION, "issues": issues},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
     def test_discovers_random_token_links_and_rejects_external_host(self):
         links = jpx_short.discover_short_urls(INDEX.read_text(encoding="utf-8"))
         self.assertEqual(sorted(links), [date(2026, 7, 17), date(2026, 7, 21)])
@@ -293,6 +303,161 @@ class JPXShortTests(unittest.TestCase):
 
         self.assertTrue(calls[0][0].get_header("User-agent").startswith("Mozilla/5.0"))
 
+    # ---- 増分10.5: 空売り報告終了イベント -----------------------------
+
+    def test_synthesize_report_endings_flags_seller_absent_from_source(self):
+        destination = {
+            "1301": {
+                "name": "テスト銘柄",
+                "events": [
+                    {
+                        "date": "2026-07-14",
+                        "ratio": 0.02,
+                        "qty": 1000,
+                        "seller": "Foo Capital",
+                    }
+                ],
+            }
+        }
+        source = {
+            "1301": {
+                "name": "テスト銘柄",
+                "events": [
+                    {
+                        "date": "2026-07-21",
+                        "ratio": 0.03,
+                        "qty": 2000,
+                        "seller": "Bar Capital",
+                    }
+                ],
+            }
+        }
+        endings = jpx_short._synthesize_report_endings(
+            destination, source, date(2026, 7, 21)
+        )
+        self.assertEqual(
+            endings,
+            {
+                "1301": {
+                    "name": "テスト銘柄",
+                    "events": [
+                        {
+                            "date": "2026-07-21",
+                            "ratio": 0.0,
+                            "qty": None,
+                            "seller": "Foo Capital",
+                            "below_threshold": True,
+                        }
+                    ],
+                }
+            },
+        )
+
+    def test_synthesize_report_endings_is_idempotent_when_already_below_threshold(self):
+        destination = {
+            "1301": {
+                "name": "テスト銘柄",
+                "events": [
+                    {
+                        "date": "2026-07-14",
+                        "ratio": 0.0,
+                        "qty": None,
+                        "seller": "Foo Capital",
+                        "below_threshold": True,
+                    }
+                ],
+            }
+        }
+        source = {}  # 引き続きFoo Capitalは当日スナップショットに不在
+        endings = jpx_short._synthesize_report_endings(
+            destination, source, date(2026, 7, 21)
+        )
+        self.assertEqual(endings, {})
+
+    def test_synthesize_report_endings_skips_seller_still_present(self):
+        destination = {
+            "1301": {
+                "name": "テスト銘柄",
+                "events": [
+                    {
+                        "date": "2026-07-14",
+                        "ratio": 0.02,
+                        "qty": 1000,
+                        "seller": "Foo Capital",
+                    }
+                ],
+            }
+        }
+        source = {
+            "1301": {
+                "name": "テスト銘柄",
+                "events": [
+                    {
+                        "date": "2026-07-21",
+                        "ratio": 0.025,
+                        "qty": 1200,
+                        "seller": "Foo Capital",
+                    }
+                ],
+            }
+        }
+        endings = jpx_short._synthesize_report_endings(
+            destination, source, date(2026, 7, 21)
+        )
+        self.assertEqual(endings, {})
+
+    def test_synthesize_report_endings_handles_whole_code_absent_from_source(self):
+        destination = {
+            "1301": {
+                "name": "テスト銘柄",
+                "events": [
+                    {"date": "2026-07-14", "ratio": 0.02, "qty": 1000, "seller": "A"},
+                    {"date": "2026-07-14", "ratio": 0.01, "qty": 500, "seller": "B"},
+                ],
+            }
+        }
+        source = {
+            "9999": {
+                "name": "別銘柄",
+                "events": [
+                    {"date": "2026-07-21", "ratio": 0.03, "qty": 3000, "seller": "C"}
+                ],
+            }
+        }
+        endings = jpx_short._synthesize_report_endings(
+            destination, source, date(2026, 7, 21)
+        )
+        self.assertEqual(sorted(e["seller"] for e in endings["1301"]["events"]), ["A", "B"])
+        for event in endings["1301"]["events"]:
+            self.assertEqual(event["date"], "2026-07-21")
+            self.assertEqual(event["ratio"], 0.0)
+            self.assertIsNone(event["qty"])
+            self.assertTrue(event["below_threshold"])
+
+    def test_seller_reappearing_after_below_threshold_resumes_normal_events(self):
+        # 再登場: below_threshold後に同じ報告者が通常イベントで復帰したら、
+        # 最新イベントは通常のものに戻る(run_updateが日毎に行う
+        # merge→synthesize の順序をそのまま踏襲して検証する)
+        existing = {
+            "1301": {
+                "name": "テスト銘柄",
+                "events": [
+                    {"date": "2026-07-07", "ratio": 0.02, "qty": 1000, "seller": "Foo"}
+                ],
+            }
+        }
+        day1_snapshot = {"1301": {"name": "テスト銘柄", "events": []}}  # Fooが消える
+        jpx_short._merge_issues(existing, day1_snapshot)
+        endings1 = jpx_short._synthesize_report_endings(
+            existing, day1_snapshot, date(2026, 7, 14)
+        )
+        jpx_short._merge_issues(existing, endings1)
+        latest_after_day1 = max(
+            existing["1301"]["events"], key=lambda event: event["date"]
+        )
+        self.assertTrue(latest_after_day1.get("below_threshold"))
+
+        day2_snapshot = {
 
 if __name__ == "__main__":
     unittest.main()
