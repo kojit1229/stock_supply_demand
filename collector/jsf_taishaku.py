@@ -12,11 +12,19 @@ not change) is::
     }
     taishaku_meta.json = {schema_version, latest_apply_date, generated_at,
                            snapshot_count}
+    taishaku_series/{XX}.json (increment 14a) = {
+        schema_version, dates: ["YYYY-MM-DD", ...],
+        issues: {"1301": {yushi_zan, kashikabu_zan, sashihiki_zan, yushi_shin,
+                           yushi_hen, kashikabu_shin, kashikabu_hen: [...]}},
+    }  # arrays are as long as ``dates``; missing issue-days are null;
+       # window is the most recent 500 dates; shard key is the code's first
+       # two characters (same convention as series/{XX}.json)
 
-This module is the only writer of ``taishaku/`` and ``taishaku_meta.json``; it
-must never touch ``meta.json``, ``issues.json``, ``series/``, ``weekly/``,
-``short/``, ``short_meta.json``, ``prices/``, or ``prices_meta.json`` (each of
-those has its own dedicated writer elsewhere in ``collector/``).
+This module is the only writer of ``taishaku/``, ``taishaku_meta.json``, and
+``taishaku_series/``; it must never touch ``meta.json``, ``issues.json``,
+``series/``, ``weekly/``, ``short/``, ``short_meta.json``, ``prices/``, or
+``prices_meta.json`` (each of those has its own dedicated writer elsewhere in
+``collector/``).
 
 Source: https://www.taisyaku.jp/data/zandaka.csv -- a fixed URL that always
 serves the latest snapshot only (cp932, no historical backfill available), so
@@ -56,6 +64,18 @@ RETRY_BACKOFF_SECONDS = 5.0
 
 SCHEMA_VERSION = 1
 META_SCHEMA_VERSION = 1
+SERIES_SCHEMA_VERSION = 1
+# design.md §4 taishaku_seriesの正典7フィールド(name/seido_kai/seido_uriは対象外)
+SERIES_FIELDS = (
+    "yushi_zan",
+    "kashikabu_zan",
+    "sashihiki_zan",
+    "yushi_shin",
+    "yushi_hen",
+    "kashikabu_shin",
+    "kashikabu_hen",
+)
+MAX_SERIES_DATES = 500
 TOKYO_EXCHANGE_LABEL = "東証およびＰＴＳ"
 # 監査時点の実測(4,751行)より十分小さい下限。フォーマット破損・truncateの検知用
 MIN_DATA_ROWS = 3_000
@@ -363,6 +383,121 @@ def _write_snapshot_and_meta(
         raise
 
 
+# ---------------------------------------------------------------------------
+# 増分14a: taishaku_series/{XX}.json(design.md §4)
+#
+# 通常経路は既存shardへの増分マージ(_merge_snapshot_into_series)。shardが
+# 存在しない(初回)か構造的に壊れている場合のみ、data/taishaku/の全スナップ
+# ショットから再構築する(rebuild_series、自己修復)。両経路とも
+# _write_series_shardsで原子的に書き出す。
+# ---------------------------------------------------------------------------
+
+
+def _load_all_snapshots(taishaku_dir: Path) -> list[dict[str, Any]]:
+    """Load and validate every taishaku/{date}.json snapshot, oldest first.
+
+    再構築(rebuild_series)専用。通常の増分経路では使わない。
+    """
+    if not taishaku_dir.is_dir():
+        return []
+    snapshots: list[dict[str, Any]] = []
+    for path in sorted(taishaku_dir.glob("*.json")):
+        if not _ISO_DATE_STEM.fullmatch(path.stem):
+            continue
+        document = _load_existing_snapshot(path)
+        if document is not None:
+            snapshots.append(document)
+    snapshots.sort(key=lambda document: document["apply_date"])
+    return snapshots
+
+
+def _build_series_documents(
+    snapshots: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Build the full taishaku_series/{shard}.json mapping from an ordered
+    (ascending apply_date, already ≤500-deduplicated-by-date) snapshot list.
+
+    Used only by the rebuild path; the normal path uses
+    ``_merge_snapshot_into_series`` instead so it doesn't have to re-read
+    every historical snapshot on every run.
+    """
+    retained = snapshots[-MAX_SERIES_DATES:]
+    dates = [document["apply_date"] for document in retained]
+
+    all_codes: set[str] = set()
+    for document in retained:
+        all_codes.update(document["issues"])
+
+    shard_documents: dict[str, dict[str, Any]] = {}
+    for code in sorted(all_codes):
+        series: dict[str, list[Any]] = {field: [] for field in SERIES_FIELDS}
+        for document in retained:
+            issue = document["issues"].get(code)
+            for field in SERIES_FIELDS:
+                series[field].append(issue[field] if issue is not None else None)
+        shard = code[:2]
+        shard_documents.setdefault(
+            shard,
+            {"schema_version": SERIES_SCHEMA_VERSION, "dates": dates, "issues": {}},
+        )["issues"][code] = series
+    return shard_documents
+
+
+def _load_existing_series_shards(
+    series_dir: Path,
+) -> tuple[dict[str, dict[str, Any]], list[str]] | None:
+    """Load and cross-validate every taishaku_series/*.json shard.
+
+    Returns ``(shards_by_prefix, dates)`` when the on-disk state is internally
+    consistent: matching schema_version, an identical ``dates`` array shared
+    by every shard, and every field array exactly as long as ``dates``.
+    Returns ``None`` for anything else (missing directory, no shard files, or
+    any structural inconsistency) so the caller falls back to
+    ``rebuild_series`` (self-healing) instead of trying to patch broken state.
+    """
+    if not series_dir.is_dir():
+        return None
+    shard_paths = sorted(series_dir.glob("*.json"))
+    if not shard_paths:
+        return None
+
+    shards: dict[str, dict[str, Any]] = {}
+    reference_dates: list[str] | None = None
+    for path in shard_paths:
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(document, dict):
+            return None
+        if document.get("schema_version") != SERIES_SCHEMA_VERSION:
+            return None
+        dates = document.get("dates")
+        if not isinstance(dates, list) or not all(
+            isinstance(item, str) and _ISO_DATE_STEM.fullmatch(item) for item in dates
+        ):
+            return None
+        if reference_dates is None:
+            reference_dates = dates
+        elif dates != reference_dates:
+            return None  # shard間でdatesが食い違っている=壊れている
+        issues = document.get("issues")
+        if not isinstance(issues, dict):
+            return None
+        for code, series in issues.items():
+            if not isinstance(code, str) or code[:2] != path.stem:
+                return None
+            if not isinstance(series, dict) or set(series) != set(SERIES_FIELDS):
+                return None
+            for field in SERIES_FIELDS:
+                values = series[field]
+                if not isinstance(values, list) or len(values) != len(dates):
+                    return None
+                for value in values:
+                    if value is not None and (
+                        isinstance(value, bool) or not isinstance(value, int)
+                    ):
+                        return None
 def run_update(
     out_dir: str | os.PathLike[str],
     *,
