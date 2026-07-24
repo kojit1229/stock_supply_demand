@@ -556,6 +556,163 @@ class JSFTaishakuTests(unittest.TestCase):
             "issues": {
                 "1301": {field: 999 for field in jsf_taishaku.SERIES_FIELDS},
             },
+        }
+        result = jsf_taishaku._merge_snapshot_into_series(shards, dates, snapshot)
+        self.assertEqual(len(result["13"]["dates"]), 500)
+        self.assertEqual(result["13"]["dates"][0], "D0001")  # D0000が落ちた
+        self.assertEqual(result["13"]["dates"][-1], "D0500")
+        for field in jsf_taishaku.SERIES_FIELDS:
+            values = result["13"]["issues"]["1301"][field]
+            self.assertEqual(len(values), 500)
+            self.assertEqual(values[0], 1)  # 元のindex0(D0000相当)が落ちている
+            self.assertEqual(values[-1], 999)
+
+    def test_merge_snapshot_into_series_rejects_out_of_order_date(self):
+        shards = {
+            "13": {
+                "schema_version": 1,
+                "dates": ["2026-07-23"],
+                "issues": {
+                    "1301": {field: [1] for field in jsf_taishaku.SERIES_FIELDS}
+                },
+            }
+        }
+        snapshot = {
+            "apply_date": "2026-07-22",  # 既存の最終日より前
+            "issues": {"1301": {field: 2 for field in jsf_taishaku.SERIES_FIELDS}},
+        }
+        with self.assertRaises(jsf_taishaku.TaishakuError):
+            jsf_taishaku._merge_snapshot_into_series(shards, ["2026-07-23"], snapshot)
+
+    def test_rebuild_series_reconstructs_from_snapshots_when_shard_directory_missing(self):
+        out = self.root / "data"
+        day1 = self._write_source(self.fixture_text, "day1.csv")
+        jsf_taishaku.run_update(
+            out, source=day1, generated_at=GENERATED_AT, min_data_rows=SMALL_MIN_ROWS
+        )
+        day2_text = _with_apply_date(self.fixture_text, "2026/07/23", "2026/07/27")
+        day2 = self._write_source(day2_text, "day2.csv")
+        jsf_taishaku.run_update(
+            out, source=day2, generated_at="2026-07-23T09:00:00Z", min_data_rows=SMALL_MIN_ROWS
+        )
+
+        shutil.rmtree(out / "taishaku_series")
+        rebuilt = jsf_taishaku.rebuild_series(out)
+        self.assertEqual(rebuilt["13"]["dates"], ["2026-07-22", "2026-07-23"])
+        self.assertEqual(rebuilt["13"]["issues"]["1301"]["yushi_zan"], [8200, 8200])
+        on_disk = json.loads((out / "taishaku_series" / "13.json").read_text(encoding="utf-8"))
+        self.assertEqual(on_disk, rebuilt["13"])
+
+    def test_rebuild_series_trims_to_500_most_recent_snapshots(self):
+        # reviewer指摘B(2): _merge_snapshot_into_seriesの単体テストとは別に、
+        # rebuild_series経路自体(_load_all_snapshots→_build_series_documents→
+        # 原子書き出し)が500件超のスナップショット群から実際に最新500日へ
+        # トリムすることを固定化する。505件のスナップショットをtaishaku/へ
+        # 直接合成し(実CSVパースは不要、契約どおりの最小dictでよい)、
+        # rebuild_seriesを直接呼ぶ
+        out = self.root / "data"
+        taishaku_dir = out / "taishaku"
+        taishaku_dir.mkdir(parents=True)
+        total_days = 505
+        start = date(2020, 1, 1)
+        all_dates = [(start + timedelta(days=i)).isoformat() for i in range(total_days)]
+        for index, day in enumerate(all_dates):
+            document = {
+                "schema_version": 1,
+                "apply_date": day,
+                "settle_date": day,
+                "report_type": "確報",
+                "issue_count": 1,
+                "issues": {
+                    "1301": {
+                        "name": "極洋",
+                        "yushi_shin": index,
+                        "yushi_hen": index,
+                        "yushi_zan": index,
+                        "kashikabu_shin": index,
+                        "kashikabu_hen": index,
+                        "kashikabu_zan": index,
+                        "sashihiki_zan": index,
+                        "seido_kai": None,
+                        "seido_uri": None,
+                    }
+                },
+            }
+            (taishaku_dir / f"{day}.json").write_text(
+                json.dumps(document, ensure_ascii=False), encoding="utf-8"
+            )
+
+        rebuilt = jsf_taishaku.rebuild_series(out)
+
+        shard = rebuilt["13"]
+        self.assertEqual(len(shard["dates"]), 500)
+        self.assertEqual(shard["dates"], all_dates[-500:])
+        self.assertEqual(shard["issues"]["1301"]["yushi_zan"][0], total_days - 500)
+        self.assertEqual(shard["issues"]["1301"]["yushi_zan"][-1], total_days - 1)
+
+        on_disk = json.loads((out / "taishaku_series" / "13.json").read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["dates"], all_dates[-500:])
+        self.assertEqual(len(on_disk["issues"]["1301"]["yushi_zan"]), 500)
+
+    def test_run_update_self_heals_when_series_directory_is_missing(self):
+
+        out = self.root / "data"
+        day1 = self._write_source(self.fixture_text, "day1.csv")
+        jsf_taishaku.run_update(
+            out, source=day1, generated_at=GENERATED_AT, min_data_rows=SMALL_MIN_ROWS
+        )
+        shutil.rmtree(out / "taishaku_series")
+
+        day2_text = _with_apply_date(self.fixture_text, "2026/07/23", "2026/07/27")
+        day2 = self._write_source(day2_text, "day2.csv")
+        jsf_taishaku.run_update(
+            out, source=day2, generated_at="2026-07-23T09:00:00Z", min_data_rows=SMALL_MIN_ROWS
+        )
+        # run_update自身が自動的に全再構築へフォールバックし、1日目も含めて
+        # 復元されている(増分マージだけだと1日目が失われる)
+        shard = json.loads((out / "taishaku_series" / "13.json").read_text(encoding="utf-8"))
+        self.assertEqual(shard["dates"], ["2026-07-22", "2026-07-23"])
+
+    def test_run_update_self_heals_when_existing_shard_is_corrupted(self):
+        out = self.root / "data"
+        day1 = self._write_source(self.fixture_text, "day1.csv")
+        jsf_taishaku.run_update(
+            out, source=day1, generated_at=GENERATED_AT, min_data_rows=SMALL_MIN_ROWS
+        )
+        # 別shard(名証等ではなく25番台)のdatesを故意にずらして「壊れている」状態にする
+        corrupt_path = out / "taishaku_series" / "25.json"
+        corrupt_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "dates": ["2026-07-21"],  # 13.jsonのdatesと食い違う
+                    "issues": {
+                        "25935": {field: [1] for field in jsf_taishaku.SERIES_FIELDS}
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        day2_text = _with_apply_date(self.fixture_text, "2026/07/23", "2026/07/27")
+        day2 = self._write_source(day2_text, "day2.csv")
+        jsf_taishaku.run_update(
+            out, source=day2, generated_at="2026-07-23T09:00:00Z", min_data_rows=SMALL_MIN_ROWS
+        )
+
+        shard_13 = json.loads((out / "taishaku_series" / "13.json").read_text(encoding="utf-8"))
+        shard_25 = json.loads((out / "taishaku_series" / "25.json").read_text(encoding="utf-8"))
+        # 全shardが同じdates(2日分)に揃っている=壊れたshardごと全再構築された
+        self.assertEqual(shard_13["dates"], ["2026-07-22", "2026-07-23"])
+        self.assertEqual(shard_25["dates"], ["2026-07-22", "2026-07-23"])
+        self.assertEqual(shard_25["issues"]["25935"]["yushi_zan"], [7600, 7600])
+
+    def test_load_existing_series_shards_returns_none_for_missing_directory(self):
+        self.assertIsNone(
+            jsf_taishaku._load_existing_series_shards(self.root / "no-such-dir")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
