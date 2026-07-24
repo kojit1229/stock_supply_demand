@@ -359,6 +359,135 @@ class BackfillJSDATests(unittest.TestCase):
 
     def test_backfill_passes_min_issue_count_through_z_plus_s_path(self):
         # z+sマージ経路でも、build_z_weekly単独経路と同じmin_issue_count下限が
+        # 効くことを確認する(build_weeklyへの下限引き回し漏れの回帰防止)
+        cache = self._cache_s_archive()
+        output = self.root / "data"
+        result = backfill_jsda.run_backfill(
+            date(2026, 1, 2),
+            date(2026, 1, 2),
+            output,
+            cache,
+            today=date(2026, 7, 22),
+            min_issue_count=6,  # フィクスチャのzは5銘柄しかないので下限未満で失敗する
+        )
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertTrue(result.failures)
+        self.assertIn("銘柄数が下限未満", result.failures[0])
+
+    def test_backfill_three_weeks_end_to_end_reports_correct_s_coverage(self):
+        # 2026-01-02(z+s)/01-09(zのみ)/01-16(z+s訂正版)の3週をまとめて処理し、
+        # sカバレッジの集計(s_missing_weeks)が週単位で正しく仕分けられることを
+        # 確認する。既存z値(全週共通taishaku)が変化しないことも合わせて確認
+        cache = self._cache_s_archive()
+        output = self.root / "data"
+        result = backfill_jsda.run_backfill(
+            date(2026, 1, 2),
+            date(2026, 1, 16),
+            output,
+            cache,
+            today=date(2026, 7, 22),
+            min_issue_count=3,
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(
+            result.processed_weeks, ["2026-01-02", "2026-01-09", "2026-01-16"]
+        )
+        self.assertEqual(result.s_missing_weeks, ["2026-01-09"])
+
+        taishaku_values = set()
+        for week in result.processed_weeks:
+            document = json.loads(
+                (output / "weekly" / f"{week}.json").read_text(encoding="utf-8")
+            )
+            taishaku_values.add(
+                json.dumps(
+                    document["issues"]["285A"]["taishaku"], sort_keys=True
+                )
+            )
+        # 3週とも同じzバイト(20260710z_sample.xlsxの複製)から作られているので
+        # taishakuは全週で完全一致するはず(sの有無はtaishakuに影響しない)
+        self.assertEqual(len(taishaku_values), 1)
+
+        series = json.loads(
+            (output / "series" / "28.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(series["issues"]["285A"]["lend_qty"]), 3)
+
+    # ---- reviewer指摘B(2026-07-24、増分11.5条件付き合格分) --------------
+
+    def test_s_present_but_content_corrupt_fails_the_whole_week(self):
+        # 指摘B(1): sメンバーはzipから正常に展開できるが、中身が
+        # shinkiワークブックとして不正(ここではzワークブックを誤ってs名で
+        # 詰めた想定)なら、build_weekly側の検証で例外になり、その週は
+        # (zが正常でも)s欠落としてフォールバックせずfailuresに入ることを
+        # 固定する(build_weekly経由の既存分岐)
+        cache = self.root / "cache"
+        cache.mkdir()
+        z_bytes = (FIXTURES / "20260710z_sample.xlsx").read_bytes()
+        with ZipFile(cache / "202601-06.zip", "w") as archive:
+            archive.writestr("20260302z.xlsx", z_bytes)
+            # sのシートが無い(zの中身)ため、parse_shinkiが必ず失敗する
+            archive.writestr("20260302s.xlsx", z_bytes)
+
+        output = self.root / "data"
+        result = backfill_jsda.run_backfill(
+            date(2026, 3, 2),
+            date(2026, 3, 2),
+            output,
+            cache,
+            today=date(2026, 7, 22),
+            min_issue_count=3,
+        )
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.processed_weeks, [])
+        self.assertTrue(result.failures)
+        self.assertIn("2026-03-02", result.failures[0])
+        self.assertFalse((output / "weekly" / "2026-03-02.json").exists())
+
+    def test_one_corrupt_s_zip_member_does_not_block_other_weeks(self):
+        # 指摘A修正の確認: 半期zip内で2026-02-09のsメンバーだけがCRC破損して
+        # いても、2026-02-02のsは正常に取り込まれ、破損週(2026-02-09)だけが
+        # sの欠落として個別に記録される(以前は関数全体が例外になり、
+        # 半期の全週がs欠落へフォールバックしていた)
+        cache = self._cache_s_corrupt_member_archive()
+        output = self.root / "data"
+        result = backfill_jsda.run_backfill(
+            date(2026, 2, 2),
+            date(2026, 2, 9),
+            output,
+            cache,
+            today=date(2026, 7, 22),
+            min_issue_count=3,
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.processed_weeks, ["2026-02-02", "2026-02-09"])
+        # 破損した週(02-09)だけがs欠落として記録され、正常な週(02-02)は
+        # フォールバックしない
+        self.assertEqual(result.s_missing_weeks, ["2026-02-09"])
+        self.assertTrue(
+            any("2026-02-09" in notice for notice in result.s_notices),
+            result.s_notices,
+        )
+
+        control_week = json.loads(
+            (output / "weekly" / "2026-02-02.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            control_week["source_files"], ["20260202z.xlsx", "20260202s.xlsx"]
+        )
+        self.assertNotEqual(control_week["issues"]["285A"]["shinki"], {})
+
+        corrupt_week = json.loads(
+            (output / "weekly" / "2026-02-09.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(corrupt_week["source_files"], ["20260209z.xlsx"])
+        for issue in corrupt_week["issues"].values():
+            self.assertEqual(issue["shinki"], {})
+
 
 if __name__ == "__main__":
     unittest.main()
