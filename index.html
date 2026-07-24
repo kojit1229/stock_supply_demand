@@ -229,6 +229,26 @@
       font-variant-numeric: tabular-nums;
     }
 
+    .flow-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
+    .flow-header { display: flex; align-items: center; gap: 10px; margin-bottom: 2px; }
+    .flow-header h3 { margin: 0; font-size: .92rem; }
+    .flow-surge-tag {
+      display: inline-block;
+      padding: 2px 9px;
+      border: 1px solid rgba(240, 179, 76, .45);
+      border-radius: 999px;
+      background: rgba(240, 179, 76, .16);
+      color: #ffcf8a;
+      font-size: .7rem;
+      font-weight: 700;
+    }
+    .flow-explainer { margin: 6px 0 12px; color: var(--muted); font-size: .8rem; }
+    /* reviewer指摘A: .chart-wrapと併用すると同詳細度でソース順により.chart-wrapのmin-height:320px
+       (モバイルではheight:280px固定)に負けて120pxにならない。.chart-wrapを継承せず、
+       必要なスタイルだけをここに持たせ、height:120pxを明示して固定する */
+    .flow-chart-wrap { position: relative; width: 100%; height: 120px; }
+    .flow-chart-wrap canvas { display: block; width: 100%; height: 120px; }
+
     .chart-wrap { position: relative; width: 100%; min-height: 320px; }
     #series-chart { display: block; width: 100%; height: 320px; }
 
@@ -467,6 +487,10 @@
     const PRICE_TREND_MIN_POINTS = 5; // 株価週足の非null本数がこれ未満なら株価照らし合わせ行を非表示
     const SHORT_MARKER_THRESHOLD_PT = 0.1; // 空売りイベントマーカー: 前週末比 ±0.1ptで▲▽判定(増分10)
     const SHORT_MARKER_LIST_LIMIT = 5; // 明細リストの直近件数
+    const FLOW_SURGE_PERCENTILE = 90; // 週次フロー(s_borrow_qty): 収録期間内で90パーセンタイル以上を急増週(増分11後半)
+    const FLOW_SURGE_RECENT_WEEKS = 8; // 直近何週以内に急増週があれば段ヘッダに「フロー急増」タグを出すか
+    const FLOW_BAR_COLOR = '#6C93A6'; // 既存系列(赤橙・黄・青・紫)と被らない落ち着いた色
+    const FLOW_SURGE_COLOR = '#F0B34C'; // 急増週の橙。badge-orange/空売りマーカー▲と同系統
 
     // 増分9: ウォッチリスト(v2-policy.md 設計警告7の契約)。端末間同期なし・localStorageのみ
     const WATCHLIST_KEY = 'jukyu_watchlist_v1';
@@ -1091,6 +1115,77 @@
       });
     }
 
+    // 週次フロー(s_borrow_qty)の棒グラフ。残高チャートとは別Canvas・別軸(v2-policy警告1: ストックと
+    // フローを同軸に重ねない)。週軸(xAt)は残高チャートと同じ計算式・同じbounds.left/rightを使い、
+    // 2枚のCanvasの週位置がピクセル単位で揃うようにする(hasPriceValuesで右余白を残高チャートと合わせる)
+    function drawFlowChart(canvas, weeks, values, surgeFlags, hasPriceValues) {
+      if (!canvas || !canvas.getContext) return;
+      const context = canvas.getContext('2d');
+      if (!context) return;
+
+      const cssWidth = Math.max(280, Math.floor(canvas.getBoundingClientRect().width || canvas.parentElement.clientWidth || 600));
+      const cssHeight = canvas.clientHeight || 120;
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 3);
+      canvas.width = Math.floor(cssWidth * pixelRatio);
+      canvas.height = Math.floor(cssHeight * pixelRatio);
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      context.clearRect(0, 0, cssWidth, cssHeight);
+
+      const bounds = { left: 58, right: hasPriceValues ? 56 : 14, top: 10, bottom: 20 };
+      const plotWidth = Math.max(1, cssWidth - bounds.left - bounds.right);
+      const plotHeight = Math.max(1, cssHeight - bounds.top - bounds.bottom);
+      const validValues = (values || []).filter(isNumber);
+
+      if (!weeks.length || !validValues.length) {
+        context.fillStyle = '#9aabb9';
+        context.font = '12px -apple-system, sans-serif';
+        context.textAlign = 'center';
+        context.fillText('表示できるデータがありません', cssWidth / 2, cssHeight / 2);
+        return;
+      }
+
+      const maximum = Math.max.apply(null, validValues);
+      const yMaximum = maximum > 0 ? maximum * 1.1 : 1;
+      const xAt = function (index) {
+        return weeks.length === 1 ? bounds.left + plotWidth / 2 : bounds.left + plotWidth * index / (weeks.length - 1);
+      };
+      const barWidth = weeks.length > 1 ? Math.max(1.5, (plotWidth / (weeks.length - 1)) * 0.6) : 6;
+
+      context.strokeStyle = '#263545';
+      context.lineWidth = 1;
+      context.font = '10px -apple-system, sans-serif';
+      context.textAlign = 'right';
+      context.textBaseline = 'middle';
+      for (let line = 0; line <= 2; line += 1) {
+        const ratio = line / 2;
+        const y = bounds.top + plotHeight * ratio;
+        context.beginPath();
+        context.moveTo(bounds.left, y);
+        context.lineTo(cssWidth - bounds.right, y);
+        context.stroke();
+        context.fillStyle = '#8294a3';
+        context.fillText(formatCompact(yMaximum * (1 - ratio)), bounds.left - 8, y);
+      }
+
+      values.forEach(function (value, index) {
+        if (!isNumber(value)) return;
+        const x = xAt(index);
+        const barHeight = plotHeight * (value / yMaximum);
+        const y = bounds.top + plotHeight - barHeight;
+        context.fillStyle = (surgeFlags && surgeFlags[index]) ? FLOW_SURGE_COLOR : FLOW_BAR_COLOR;
+        context.fillRect(x - barWidth / 2, y, barWidth, barHeight);
+      });
+
+      const labelIndexes = weeks.length === 1 ? [0] : [0, Math.floor((weeks.length - 1) / 2), weeks.length - 1];
+      context.fillStyle = '#8294a3';
+      context.font = '10px -apple-system, sans-serif';
+      context.textBaseline = 'top';
+      labelIndexes.forEach(function (index, position) {
+        context.textAlign = position === 0 ? 'left' : (position === labelIndexes.length - 1 ? 'right' : 'center');
+        context.fillText(shortDate(weeks[index]), xAt(index), cssHeight - bounds.bottom + 6);
+      });
+    }
+
     // SIGNAL(需給シグナルカード。design.md §6の確定仕様。完全決定論・追加fetchなし)
     function borrowBalanceSeries(weeks, issue) {
       if (!issue) return weeks.map(function () { return null; });
@@ -1140,6 +1235,30 @@
       if (level === 'top') return '(過去3年でも多い水準)';
       if (level === 'bottom') return '(過去3年でも少ない水準)';
       return '';
+    }
+
+    // FLOW(増分11後半。週次フロー段=s_borrow_qtyの棒グラフ。design.md §6「週次フロー段」)
+    // 値がvalidValues内で何パーセンタイルに位置するか(0〜100)。nearest-rank方式(自分以下の値の割合)。
+    // 例: 10個の値[1..10]のうち9(=90%目の値)はcountLE=9→90.0ちょうど、8はcountLE=8→80.0
+    function percentileRankOf(value, validValues) {
+      if (!validValues.length) return null;
+      const countLE = validValues.filter(function (v) { return v <= value; }).length;
+      return (countLE / validValues.length) * 100;
+    }
+
+    // 各週が「急増週」(収録期間内の非null値の上位10%水準=90パーセンタイル以上)かどうかを返す(bool配列、weeksと同長)
+    function computeFlowSurgeFlags(values) {
+      const list = Array.isArray(values) ? values : [];
+      const validValues = list.filter(isNumber);
+      return list.map(function (value) {
+        if (!isNumber(value) || !validValues.length) return false;
+        const rank = percentileRankOf(value, validValues);
+        return rank !== null && rank >= FLOW_SURGE_PERCENTILE;
+      });
+    }
+
+    function hasRecentFlowSurge(surgeFlags, recentCount) {
+      return surgeFlags.slice(-recentCount).some(function (flag) { return flag; });
     }
 
     // 各報告者の「基準日以前の最新ratio」を合計する
@@ -1533,6 +1652,28 @@
           '</ul>';
       }
 
+      // 週次フロー段(増分11後半)。s_borrow_qtyが全週nullの銘柄は段ごと非表示(「データなし」表示も出さない)
+      const sBorrowValues = Array.isArray(issue.s_borrow_qty) ? issue.s_borrow_qty : [];
+      const sLendValues = Array.isArray(issue.s_lend_qty) ? issue.s_lend_qty : [];
+      const hasFlowData = sBorrowValues.some(isNumber);
+      const flowSurgeFlags = hasFlowData ? computeFlowSurgeFlags(sBorrowValues) : [];
+      const hasRecentFlowSurgeFlag = hasFlowData && hasRecentFlowSurge(flowSurgeFlags, FLOW_SURGE_RECENT_WEEKS);
+      let flowSectionHtml = '';
+      if (hasFlowData) {
+        const latestBorrowFlow = latestIndex >= 0 ? sBorrowValues[latestIndex] : null;
+        const latestLendFlow = latestIndex >= 0 ? sLendValues[latestIndex] : null;
+        flowSectionHtml =
+          '<div class="flow-section">' +
+            '<div class="flow-header">' +
+              '<h3>週次フロー(新規成約)</h3>' +
+              (hasRecentFlowSurgeFlag ? '<span class="flow-surge-tag">フロー急増</span>' : '') +
+            '</div>' +
+            '<p class="section-subtitle">最新週 借入新規 ' + formatNumber(latestBorrowFlow) + '株・貸付新規 ' + formatNumber(latestLendFlow) + '株</p>' +
+            '<p class="flow-explainer">その週に新しく成立した貸し借りの量です。上の残高が『いま積み上がっている総量』なのに対し、こちらは『その週の動き』を示します。</p>' +
+            '<div class="flow-chart-wrap"><canvas id="flow-chart" role="img" aria-label="' + escapeHtml(code) + 'の週次新規成約高（フロー）棒グラフ' + (hasRecentFlowSurgeFlag ? '（急増週あり）' : '') + '">週次フロー棒グラフ</canvas></div>' +
+          '</div>';
+      }
+
       target.innerHTML =
         '<section class="card" aria-labelledby="chart-title">' +
           '<h2 id="chart-title">貸借残高の推移</h2>' +
@@ -1541,6 +1682,7 @@
           '<ul class="legend" aria-label="系列凡例">' + legendItems.join('') + '</ul>' +
           markerListHtml +
           '<div class="chart-wrap"><canvas id="series-chart" role="img" aria-label="' + escapeHtml(code) + 'の貸借残高時系列チャート' + (hasPriceValues ? '（株価重ね描き付き）' : '') + (hasShortMarkers ? '（大口空売りイベントマーカー付き）' : '') + '">時系列チャート</canvas></div>' +
+          flowSectionHtml +
         '</section>' +
         '<section class="card" aria-labelledby="delta-title">' +
           '<h2 id="delta-title">最新週と前週の比較</h2>' +
@@ -1554,11 +1696,21 @@
           '<p>JSDAは制度貸借を除く一般貸借。貸付残高は転貸ダブルカウントの可能性があり、借株需要の代理変数として見る</p>' +
         '</details>';
 
-      state.currentChart = { weeks: weeks, issue: issue, priceValues: priceValues, shortMarkers: shortMarkers };
+      state.currentChart = {
+        weeks: weeks,
+        issue: issue,
+        priceValues: priceValues,
+        shortMarkers: shortMarkers,
+        hasPriceValues: hasPriceValues,
+        flow: hasFlowData ? { values: sBorrowValues, surgeFlags: flowSurgeFlags } : null
+      };
       // innerHTML代入直後でもgetBoundingClientRectが同期レイアウトを強制するため
       // 直接描画できる。rAF待ちにすると非表示タブ(iOS PWAのバックグラウンド復帰等)で
       // コールバックが発火せずチャートが空のままになる(2026-07-22実測)
       drawChart(document.getElementById('series-chart'), weeks, issue, priceValues, shortMarkers);
+      if (hasFlowData) {
+        drawFlowChart(document.getElementById('flow-chart'), weeks, sBorrowValues, flowSurgeFlags, hasPriceValues);
+      }
     }
 
     function renderSignalCard(target, weeks, issue, events, shortFetchFailed, prices) {
@@ -1582,6 +1734,7 @@
             '<p>・注意: 貸し借りの集計には又貸し分の二重計上がありえるため、残高の絶対値より「増えているか減っているか」を見るのがコツです。</p>' +
             '<p>・この判定は決まった計算式(閾値: 借株残4週±10%、空売り残高4週±0.5ポイント)による機械的な参考情報です。</p>' +
             '<p>・チャート下の▲▽は、大口空売りの合計割合がその週に増えた(▲)/減った(▽)ことを示します。</p>' +
+            '<p>・週次フローの棒が急に高くなった週は、貸し借りの動きが活発だった週です。残高の増減と合わせて見ると、その週に売り方の仕込み(借株の急増)があったかを推測できます。</p>' +
             '<p>もっと詳しく知りたいときは<a class="guide-link-inline" href="#/guide">用語・見方ガイド</a>もご覧ください。</p>' +
           '</details>' +
         '</section>';
@@ -1874,7 +2027,7 @@
           '<h2 id="guide-3-title">3. 残高(ストック)とフロー</h2>' +
           '<p>「残高(ストック)」は、ある時点で「今どれだけ借りたままになっているか」という量です。「フロー」は、ある期間(たとえば1週間)に「新しくどれだけ動いたか」という量です。</p>' +
           '<p>たとえるなら、残高はお風呂に溜まっているお湯の量、フローは蛇口から流れ込む水の量のようなものです。お湯の量(残高)が多くても、蛇口(フロー)が今は閉まっていることもあります。</p>' +
-          '<p>現在のシグナルカードは主に残高の変化を見ています。今後、フロー(週間の新規成約高)も別の段で表示する予定です。</p>' +
+          '<p>現在のシグナルカードは主に残高の変化を見ています。チャートの下の段に、週ごとの新規成約(フロー)の棒グラフを表示しています。</p>' +
         '</section>' +
         '<section class="card guide-section" aria-labelledby="guide-4-title">' +
           '<h2 id="guide-4-title">4. 大口空売り残高報告</h2>' +
@@ -1986,6 +2139,10 @@
         state.resizeFrame = 0;
         const chart = document.getElementById('series-chart');
         if (chart && state.currentChart) drawChart(chart, state.currentChart.weeks, state.currentChart.issue, state.currentChart.priceValues, state.currentChart.shortMarkers);
+        const flowChart = document.getElementById('flow-chart');
+        if (flowChart && state.currentChart && state.currentChart.flow) {
+          drawFlowChart(flowChart, state.currentChart.weeks, state.currentChart.flow.values, state.currentChart.flow.surgeFlags, state.currentChart.hasPriceValues);
+        }
       });
     }
 
