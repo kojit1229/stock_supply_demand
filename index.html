@@ -1091,6 +1091,18 @@
           target.innerHTML = '';
           state.currentTaishakuChart = null;
           return;
+        }
+        const dates = Array.isArray(payload.dates) ? payload.dates : [];
+        renderTaishakuCard(target, code, dates, issueData);
+      } catch (error) {
+        if (requestId !== state.routeRequest) return;
+        // fetch失敗もカード非表示(エラー文言は出さない。design.md §6の明記通り)
+        const current = document.getElementById('taishaku-content');
+        if (current) current.innerHTML = '';
+        state.currentTaishakuChart = null;
+      }
+    }
+
     // CHART
     const SHORT_MARKER_UP_COLOR = '#F0B34C'; // badge-orange(積み上がり)と同系統
     const SHORT_MARKER_DOWN_COLOR = '#73A9DF'; // badge-blue(買い戻し進行)と同系統
@@ -1322,6 +1334,94 @@
       labelIndexes.forEach(function (index, position) {
         context.textAlign = position === 0 ? 'left' : (position === labelIndexes.length - 1 ? 'right' : 'center');
         context.fillText(shortDate(weeks[index]), xAt(index), cssHeight - bounds.bottom + 6);
+      });
+    }
+
+    const TAISHAKU_YUSHI_COLOR = '#E6B85C'; // 融資残(own_qtyの黄と紛れないよう別文脈だが同系トーン)
+    const TAISHAKU_KASHIKABU_COLOR = '#6C93A6'; // 貸株残。フロー棒と同系の落ち着いた色
+
+    // 日証金カードの小チャート(増分14b)。datesは残高チャートのweeksとは無関係の独立した日次軸。
+    // 自前のx座標計算を持つ(週チャートのxAtとは再利用しない=データの性質が違うため)
+    function drawTaishakuChart(canvas, dates, yushiValues, kashikabuValues) {
+      if (!canvas || !canvas.getContext) return;
+      const context = canvas.getContext('2d');
+      if (!context) return;
+
+      const cssWidth = Math.max(280, Math.floor(canvas.getBoundingClientRect().width || canvas.parentElement.clientWidth || 600));
+      const cssHeight = canvas.clientHeight || 100;
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 3);
+      canvas.width = Math.floor(cssWidth * pixelRatio);
+      canvas.height = Math.floor(cssHeight * pixelRatio);
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      context.clearRect(0, 0, cssWidth, cssHeight);
+
+      const bounds = { left: 58, right: 14, top: 10, bottom: 18 };
+      const plotWidth = Math.max(1, cssWidth - bounds.left - bounds.right);
+      const plotHeight = Math.max(1, cssHeight - bounds.top - bounds.bottom);
+      const values = [];
+      (yushiValues || []).forEach(function (v) { if (isNumber(v)) values.push(v); });
+      (kashikabuValues || []).forEach(function (v) { if (isNumber(v)) values.push(v); });
+
+      if (!dates.length || !values.length) {
+        context.fillStyle = '#9aabb9';
+        context.font = '12px -apple-system, sans-serif';
+        context.textAlign = 'center';
+        context.fillText('表示できるデータがありません', cssWidth / 2, cssHeight / 2);
+        return;
+      }
+
+      const maximum = Math.max.apply(null, values);
+      const yMaximum = maximum > 0 ? maximum * 1.08 : 1;
+      const xAt = function (index) {
+        return dates.length === 1 ? bounds.left + plotWidth / 2 : bounds.left + plotWidth * index / (dates.length - 1);
+      };
+      const yAt = function (value) { return bounds.top + plotHeight * (1 - value / yMaximum); };
+
+      context.strokeStyle = '#263545';
+      context.lineWidth = 1;
+      context.font = '10px -apple-system, sans-serif';
+      context.textAlign = 'right';
+      context.textBaseline = 'middle';
+      for (let line = 0; line <= 2; line += 1) {
+        const ratio = line / 2;
+        const y = bounds.top + plotHeight * ratio;
+        context.beginPath();
+        context.moveTo(bounds.left, y);
+        context.lineTo(cssWidth - bounds.right, y);
+        context.stroke();
+        context.fillStyle = '#8294a3';
+        context.fillText(formatCompact(yMaximum * (1 - ratio)), bounds.left - 8, y);
+      }
+
+      [
+        { values: yushiValues, color: TAISHAKU_YUSHI_COLOR },
+        { values: kashikabuValues, color: TAISHAKU_KASHIKABU_COLOR }
+      ].forEach(function (series) {
+        const items = Array.isArray(series.values) ? series.values : [];
+        let drawing = false;
+        context.beginPath();
+        items.forEach(function (value, index) {
+          if (!isNumber(value)) { drawing = false; return; }
+          const x = xAt(index);
+          const y = yAt(value);
+          if (drawing) context.lineTo(x, y);
+          else context.moveTo(x, y);
+          drawing = true;
+        });
+        context.strokeStyle = series.color;
+        context.lineWidth = 2;
+        context.lineJoin = 'round';
+        context.lineCap = 'round';
+        context.stroke();
+      });
+
+      const labelIndexes = dates.length === 1 ? [0] : [0, Math.floor((dates.length - 1) / 2), dates.length - 1];
+      context.fillStyle = '#8294a3';
+      context.font = '10px -apple-system, sans-serif';
+      context.textBaseline = 'top';
+      labelIndexes.forEach(function (index, position) {
+        context.textAlign = position === 0 ? 'left' : (position === labelIndexes.length - 1 ? 'right' : 'center');
+        context.fillText(shortDate(dates[index]), xAt(index), cssHeight - bounds.bottom + 5);
       });
     }
 
@@ -1679,6 +1779,7 @@
 
     function renderSearchPage() {
       state.currentChart = null;
+      state.currentTaishakuChart = null;
       const app = document.getElementById('app');
       const watchCount = loadWatchlist().codes.length;
       app.innerHTML = freshnessMarkup() +
@@ -1874,6 +1975,7 @@
             '<p>・この判定は決まった計算式(閾値: 借株残4週±10%、空売り残高4週±0.5ポイント)による機械的な参考情報です。</p>' +
             '<p>・チャート下の▲▽は、大口空売りの合計割合がその週に増えた(▲)/減った(▽)ことを示します。</p>' +
             '<p>・週次フローの棒が急に高くなった週は、貸し借りの動きが活発だった週です。残高の増減と合わせて見ると、その週に売り方の仕込み(借株の急増)があったかを推測できます。</p>' +
+            '<p>・下の方の「日証金(制度信用)」カードは個人投資家サイドの目安です。機関(このカード)と個人(日証金カード)で売り買いの傾きが逆になることもあります。</p>' +
             '<p>もっと詳しく知りたいときは<a class="guide-link-inline" href="#/guide">用語・見方ガイド</a>もご覧ください。</p>' +
           '</details>' +
         '</section>';
@@ -1881,6 +1983,7 @@
 
     async function renderIssuePage(code) {
       state.currentChart = null;
+      state.currentTaishakuChart = null;
       const app = document.getElementById('app');
       const info = state.issueByCode[code];
       if (!info) {
@@ -1896,15 +1999,20 @@
         '</div>' +
         '<div id="signal-content"><div class="card status-card">需給シグナルを計算しています…</div></div>' +
         '<div id="issue-content"><div class="card status-card">時系列データを読み込んでいます…</div></div>' +
+        '<div id="short-content"><div class="card status-card">空売り報告を読み込んでいます…</div></div>' +
+        '<div id="taishaku-content"><div class="card status-card">日証金データを確認しています…</div></div>';
 
       const requestId = ++state.routeRequest;
       const seriesPromise = loadSeries(info.shard);
       const shortShardPromise = loadShortShard(code.slice(0, 2));
       // 株価は(a)重ね描き専用の追加fetch。JSDA・shortの成否とは独立(404=株価未収録として扱う)
       const pricesPromise = loadPrices(code);
+      // 日証金(増分14b)も他セクションと独立した追加fetch。404・失敗はカード非表示に倒す
+      const taishakuPromise = loadTaishakuSeries(code.slice(0, 2));
 
       renderShortSection(code, requestId, shortShardPromise);
       renderSignalSection(code, requestId, seriesPromise, shortShardPromise, pricesPromise);
+      renderTaishakuSection(code, requestId, taishakuPromise);
 
       try {
         const payload = await seriesPromise;
@@ -2124,6 +2232,7 @@
 
     function renderWatchPage() {
       state.currentChart = null;
+      state.currentTaishakuChart = null;
       const app = document.getElementById('app');
       const watchlist = loadWatchlist();
       app.innerHTML = freshnessMarkup() +
@@ -2211,18 +2320,31 @@
               '<tr><td>借株残(かりかぶざん)</td><td>借りたまま返していない株の残高。このアプリの需給シグナルの主な材料です。</td></tr>' +
               '<tr><td>逆日歩(ぎゃくひぶ)</td><td>品貸料とも呼ばれる、株を借りるための追加コストのこと。借りたい人が多く株が不足すると発生します。</td></tr>' +
               '<tr><td>需給(じゅきゅう)</td><td>「買いたい人」と「売りたい人」のバランスのこと。需要(買い)と供給(売り)を合わせた言葉です。</td></tr>' +
+              '<tr><td>制度信用取引と一般信用取引</td><td>取引所が定めたルールに沿う「制度信用」と、証券会社が個別に条件を決める「一般信用」の2種類。このアプリのJSDAデータは制度信用を含まない「一般貸借」が対象です。日証金カードで表示される「融資残」「貸株残」は、この制度信用取引の残高です。</td></tr>' +
               '<tr><td>貸借取引(たいしゃくとりひき)</td><td>株や資金を貸し借りする取引全般のこと。このアプリでは主にJSDAが集計する一般貸借を指します。</td></tr>' +
               '<tr><td>転貸(てんたい)</td><td>借りた株をさらに他社に貸すこと(又貸し)。集計上、同じ株が二重に数えられる原因になります。</td></tr>' +
               '<tr><td>踏み上げ(ふみあげ)</td><td>ショートスクイーズとも呼ばれます。空売りをしていた投資家が株価上昇で買い戻さざるを得なくなり、それがさらに株価上昇を加速させる現象です。</td></tr>' +
               '<tr><td>パーセンタイル</td><td>ある値が全体の中でどのくらいの順位にあるかを示す表現。「上位20%」なら、過去のデータの中で上位20%以内に入る高い水準という意味です。</td></tr>' +
             '</tbody>' +
           '</table></div>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-9-title">' +
+          '<h2 id="guide-9-title">9. 日証金(制度信用)カードの見方</h2>' +
+          '<p>個人投資家が信用取引をするとき、多くは「制度信用」という証券取引所が決めた標準ルールに沿った枠組みを使います(証券会社が個別に条件を決める「一般信用」という枠組みもあります)。日証金(日本証券金融株式会社)は、この制度信用取引を裏で支える証券金融会社です。</p>' +
+          '<ul class="guide-list">' +
+            '<li>融資残(ゆうしざん): 信用取引で「買い」を建てている残高のことです。個人投資家が「これから値上がりする」と考えて買っている量の目安になります。</li>' +
+            '<li>貸株残(かしかぶざん): 信用取引で「売り」(空売り)を建てている残高のことです。個人投資家が「これから値下がりする」と考えて売っている量の目安になります。</li>' +
+            '<li>差引(さしひき): 融資残から貸株残を引いた値です。プラスが大きいほど「買い方優勢」、マイナスが大きいほど「売り方優勢」であることを示します。</li>' +
+          '</ul>' +
+          '<p>このアプリの他のカード(貸借残高・大口空売り)はJSDAが集計する機関投資家側のデータですが、日証金カードは個人投資家側の目安です。両方を見比べることで、「機関と個人がそれぞれどちらに傾いているか」がわかりやすくなります。</p>' +
+          '<p>データは2026-07-22の収集開始以降、日ごとに蓄積されていく仕組みです。始まったばかりの銘柄では、表示できる日数がまだ少ないことがあります。</p>' +
         '</section>'
       );
     }
 
     function renderGuidePage() {
       state.currentChart = null;
+      state.currentTaishakuChart = null;
       const app = document.getElementById('app');
       app.innerHTML = freshnessMarkup() +
         '<a class="back-link" href="#/">← トップへ</a>' +
@@ -2271,6 +2393,7 @@
     }
 
     function handleResize() {
+      if ((!state.currentChart && !state.currentTaishakuChart) || state.resizeFrame) return;
       state.resizeFrame = window.requestAnimationFrame(function () {
         state.resizeFrame = 0;
         const chart = document.getElementById('series-chart');
@@ -2278,6 +2401,10 @@
         const flowChart = document.getElementById('flow-chart');
         if (flowChart && state.currentChart && state.currentChart.flow) {
           drawFlowChart(flowChart, state.currentChart.weeks, state.currentChart.flow.values, state.currentChart.flow.surgeFlags, state.currentChart.hasPriceValues);
+        }
+        const taishakuChart = document.getElementById('taishaku-chart');
+        if (taishakuChart && state.currentTaishakuChart) {
+          drawTaishakuChart(taishakuChart, state.currentTaishakuChart.dates, state.currentTaishakuChart.yushiZan, state.currentTaishakuChart.kashikabuZan);
         }
       });
     }
