@@ -458,6 +458,162 @@ class JPXShortTests(unittest.TestCase):
         self.assertTrue(latest_after_day1.get("below_threshold"))
 
         day2_snapshot = {
+            "1301": {
+                "name": "テスト銘柄",
+                "events": [
+                    {"date": "2026-07-21", "ratio": 0.015, "qty": 800, "seller": "Foo"}
+                ],
+            }
+        }
+        jpx_short._merge_issues(existing, day2_snapshot)
+        endings2 = jpx_short._synthesize_report_endings(
+            existing, day2_snapshot, date(2026, 7, 21)
+        )
+        self.assertEqual(endings2, {})  # 再登場したので合成されない
+        latest_after_day2 = max(
+            existing["1301"]["events"], key=lambda event: event["date"]
+        )
+        self.assertEqual(latest_after_day2["date"], "2026-07-21")
+        self.assertFalse(latest_after_day2.get("below_threshold"))
+        self.assertEqual(latest_after_day2["qty"], 800)
+
+    def test_run_update_synthesizes_below_threshold_for_vanished_seller(self):
+        out = self.root / "data"
+        cache = self.root / "cache"
+        self._seed_meta(out)
+        self._seed_shard(
+            out,
+            "13",
+            {
+                "1375": {
+                    "name": "ユキグニファクトリー",
+                    "events": [
+                        {
+                            "date": "2026-07-10",
+                            "ratio": 0.01,
+                            "qty": 500,
+                            "seller": "Vanished Fund LLC",
+                        }
+                    ],
+                }
+            },
+        )
+        downloader = FixtureDownloader()
+        updated = jpx_short.run_update(
+            out,
+            cache,
+            index_html_path=INDEX,
+            downloader=downloader,
+            generated_at=GENERATED_AT,
+        )
+        self.assertEqual(updated, ("2026-07-21",))
+        shard = json.loads((out / "short" / "13.json").read_text(encoding="utf-8"))
+        events = shard["issues"]["1375"]["events"]
+        vanished_events = [e for e in events if e["seller"] == "Vanished Fund LLC"]
+        self.assertEqual(len(vanished_events), 2)  # 元イベント+合成イベント
+        synthesized = [e for e in vanished_events if e.get("below_threshold")]
+        self.assertEqual(len(synthesized), 1)
+        self.assertEqual(
+            synthesized[0],
+            {
+                "date": "2026-07-21",
+                "ratio": 0.0,
+                "qty": None,
+                "seller": "Vanished Fund LLC",
+                "below_threshold": True,
+            },
+        )
+        # 実データに残る報告者は通常どおり(below_thresholdなし)取り込まれる
+        real_events = [e for e in events if e["seller"] == "Barclays Capital Securities Ltd"]
+        self.assertEqual(len(real_events), 1)
+        self.assertNotIn("below_threshold", real_events[0])
+
+    def test_run_update_reloads_below_threshold_events_from_disk(self):
+        # 既存shardにbelow_thresholdイベントが保存されていても
+        # _load_existing_shards/_validate_eventが正しく再読込できることの確認
+        # (増分10.5前は5キーのイベントを拒否していた)
+        out = self.root / "data"
+        self._seed_shard(
+            out,
+            "13",
+            {
+                "1375": {
+                    "name": "ユキグニファクトリー",
+                    "events": [
+                        {
+                            "date": "2026-07-10",
+                            "ratio": 0.0,
+                            "qty": None,
+                            "seller": "Vanished Fund LLC",
+                            "below_threshold": True,
+                        }
+                    ],
+                }
+            },
+        )
+        reloaded = jpx_short._load_existing_shards(out / "short")
+        self.assertEqual(
+            reloaded["1375"]["events"][0]["below_threshold"], True
+        )
+        self.assertIsNone(reloaded["1375"]["events"][0]["qty"])
+
+    def test_below_threshold_event_with_nonzero_ratio_fails_loudly(self):
+        with self.assertRaises(jpx_short.JPXShortError):
+            jpx_short._validate_event(
+                {
+                    "date": "2026-07-10",
+                    "ratio": 0.01,
+                    "qty": None,
+                    "seller": "Vanished Fund LLC",
+                    "below_threshold": True,
+                },
+                "1375",
+            )
+
+    def test_below_threshold_event_with_qty_fails_loudly(self):
+        with self.assertRaises(jpx_short.JPXShortError):
+            jpx_short._validate_event(
+                {
+                    "date": "2026-07-10",
+                    "ratio": 0.0,
+                    "qty": 100,
+                    "seller": "Vanished Fund LLC",
+                    "below_threshold": True,
+                },
+                "1375",
+            )
+
+    def test_run_update_does_not_write_or_synthesize_when_any_candidate_day_fails(self):
+        # 取得失敗日には合成しない: 候補2日のうち1日でも取得に失敗したら、
+        # 成功していたはずのもう1日分も含めて何も書き出さない(既存の
+        # フェイルラウド構造がそのまま合成イベントの安全網になっていることの確認)
+        out = self.root / "data"
+        cache = self.root / "cache"
+        # 07-17より前をlatestにし、07-17と07-21の両方を候補にする
+        self._seed_meta(out, latest="2026-07-10")
+
+        class PartiallyFailingDownloader:
+            def fetch(self, url, destination):
+                if "20260717" in url or "2026-07-17" in url:
+                    raise RuntimeError("simulated fetch failure for 2026-07-17")
+                destination = Path(destination)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(WORKBOOK, destination)
+                return destination
+
+        with self.assertRaises(RuntimeError):
+            jpx_short.run_update(
+                out,
+                cache,
+                index_html_path=INDEX,
+                downloader=PartiallyFailingDownloader(),
+                generated_at=GENERATED_AT,
+            )
+
+        self.assertFalse((out / "short").exists())
+        meta = json.loads((out / "short_meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["latest_short_date"], "2026-07-10")  # 書き換わっていない
+
 
 if __name__ == "__main__":
     unittest.main()
