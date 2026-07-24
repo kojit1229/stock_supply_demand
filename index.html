@@ -1,0 +1,2452 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111821">
+  <meta name="description" content="JSDA週次貸借残高を銘柄別に確認する研究・分析用PWA">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23111821'/%3E%3Cpath d='M14 20h36v8H14zm0 16h36v8H14z' fill='%23E85D4A'/%3E%3C/svg%3E">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <link rel="manifest" href="manifest.json">
+  <title>需給ナビ</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1118;
+      --surface: #111b26;
+      --surface-2: #172331;
+      --border: #29394a;
+      --text: #eef4f8;
+      --muted: #9aabb9;
+      --increase: #e85d4a;
+      --decrease: #3fa37c;
+      --series-own: #e6b85c;
+      --series-ten: #73a9df;
+      --series-price: #b98af5;
+      --warning: #f0b34c;
+      --radius: 14px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { min-height: 100%; background: var(--bg); }
+
+    body {
+      min-height: 100vh;
+      min-height: 100dvh;
+      margin: 0;
+      background:
+        radial-gradient(circle at 90% -10%, rgba(63, 163, 124, .13), transparent 33rem),
+        var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic UI", "Yu Gothic", sans-serif;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a { color: inherit; }
+    button, input { font: inherit; }
+
+    .site-shell {
+      display: flex;
+      min-height: 100vh;
+      min-height: 100dvh;
+      flex-direction: column;
+    }
+
+    .site-header {
+      position: sticky;
+      z-index: 20;
+      top: 0;
+      border-bottom: 1px solid rgba(41, 57, 74, .8);
+      background: rgba(11, 17, 24, .9);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+    }
+
+    .header-inner,
+    main,
+    .footer-inner {
+      width: min(100% - 32px, 980px);
+      margin-inline: auto;
+    }
+
+    .header-inner {
+      display: flex;
+      min-height: 64px;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .brand {
+      color: var(--text);
+      font-size: 1.12rem;
+      font-weight: 800;
+      letter-spacing: .04em;
+      text-decoration: none;
+    }
+
+    .brand-mark { color: var(--increase); }
+    .header-tag { color: var(--muted); font-size: .75rem; }
+
+    main {
+      flex: 1;
+      padding-block: 24px 48px;
+    }
+
+    .freshness {
+      display: flex;
+      margin-bottom: 18px;
+      padding: 10px 14px;
+      align-items: center;
+      gap: 9px;
+      border: 1px solid rgba(63, 163, 124, .35);
+      border-radius: 10px;
+      background: rgba(63, 163, 124, .09);
+      color: #bce4d1;
+      font-size: .86rem;
+    }
+
+    .freshness::before {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--decrease);
+      content: "";
+      flex: none;
+    }
+
+    .freshness.warning {
+      border-color: rgba(240, 179, 76, .5);
+      background: rgba(240, 179, 76, .1);
+      color: #ffd991;
+    }
+
+    .freshness.warning::before { background: var(--warning); }
+
+    .hero { padding: 26px 0 18px; }
+    .eyebrow { margin: 0 0 5px; color: var(--decrease); font-size: .78rem; font-weight: 700; letter-spacing: .12em; }
+    h1, h2, p { margin-top: 0; }
+    h1 { margin-bottom: 8px; font-size: clamp(1.75rem, 6vw, 2.8rem); line-height: 1.25; letter-spacing: -.02em; }
+    h2 { margin-bottom: 16px; font-size: 1.08rem; }
+    .lead { max-width: 42rem; margin-bottom: 0; color: var(--muted); }
+
+    .search-box {
+      position: relative;
+      margin: 20px 0 12px;
+    }
+
+    .search-box::before {
+      position: absolute;
+      top: 50%;
+      left: 17px;
+      color: var(--muted);
+      content: "⌕";
+      font-size: 1.45rem;
+      line-height: 1;
+      transform: translateY(-53%);
+      pointer-events: none;
+    }
+
+    #issue-search {
+      width: 100%;
+      min-height: 54px;
+      padding: 13px 16px 13px 49px;
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      outline: none;
+      background: var(--surface);
+      color: var(--text);
+      font-size: 1rem;
+      -webkit-appearance: none;
+    }
+
+    #issue-search:focus {
+      border-color: var(--decrease);
+      box-shadow: 0 0 0 3px rgba(63, 163, 124, .18);
+    }
+
+    #issue-search::placeholder { color: #718493; }
+    .result-summary { min-height: 1.6em; margin: 0 2px 10px; color: var(--muted); font-size: .82rem; }
+    .result-list { display: grid; margin: 0; padding: 0; gap: 8px; list-style: none; }
+
+    .result-link {
+      display: grid;
+      padding: 14px 16px;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      background: var(--surface);
+      text-decoration: none;
+      transition: border-color .15s ease, transform .15s ease;
+    }
+
+    .result-link:hover,
+    .result-link:focus-visible { border-color: var(--decrease); transform: translateY(-1px); }
+    .result-name { overflow: hidden; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+    .issue-code { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9rem; font-weight: 700; }
+
+    .card {
+      margin-top: 16px;
+      padding: clamp(16px, 4vw, 24px);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: rgba(17, 27, 38, .92);
+      box-shadow: 0 14px 40px rgba(0, 0, 0, .16);
+    }
+
+    .issue-heading {
+      display: flex;
+      margin: 4px 0 20px;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 14px;
+    }
+
+    .back-link { display: inline-block; margin-bottom: 14px; color: var(--muted); font-size: .9rem; text-decoration: none; }
+    .back-link:hover { color: var(--text); }
+    .issue-heading h1 { margin: 0; font-size: clamp(1.5rem, 5vw, 2.25rem); }
+    .issue-heading .issue-code { font-size: 1rem; }
+    .section-subtitle { margin: -10px 0 14px; color: var(--muted); font-size: .82rem; }
+
+    .legend { display: flex; margin: 0 0 10px; padding: 0; flex-wrap: wrap; gap: 8px 16px; list-style: none; }
+    .legend li { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: .78rem; }
+    .legend-swatch { width: 18px; height: 3px; border-radius: 2px; background: var(--swatch); }
+
+    .price-summary { color: var(--muted); font-size: .82rem; }
+
+    .short-marker-list {
+      display: grid;
+      margin: 0 0 12px;
+      padding: 0;
+      gap: 4px;
+      list-style: none;
+      color: var(--muted);
+      font-size: .8rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .flow-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
+    .flow-header { display: flex; align-items: center; gap: 10px; margin-bottom: 2px; }
+    .flow-header h3 { margin: 0; font-size: .92rem; }
+    .flow-surge-tag {
+      display: inline-block;
+      padding: 2px 9px;
+      border: 1px solid rgba(240, 179, 76, .45);
+      border-radius: 999px;
+      background: rgba(240, 179, 76, .16);
+      color: #ffcf8a;
+      font-size: .7rem;
+      font-weight: 700;
+    }
+    .flow-explainer { margin: 6px 0 12px; color: var(--muted); font-size: .8rem; }
+    /* reviewer指摘A: .chart-wrapと併用すると同詳細度でソース順により.chart-wrapのmin-height:320px
+       (モバイルではheight:280px固定)に負けて120pxにならない。.chart-wrapを継承せず、
+       必要なスタイルだけをここに持たせ、height:120pxを明示して固定する */
+    .flow-chart-wrap { position: relative; width: 100%; height: 120px; }
+    .flow-chart-wrap canvas { display: block; width: 100%; height: 120px; }
+
+    .taishaku-metrics { display: flex; flex-wrap: wrap; gap: 18px; margin: 4px 0 14px; }
+    .taishaku-metric { display: flex; flex-direction: column; gap: 2px; }
+    .taishaku-metric-label { color: var(--muted); font-size: .74rem; }
+    .taishaku-metric-value { font-size: 1.25rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .taishaku-metric-delta { font-size: .78rem; font-variant-numeric: tabular-nums; }
+    .taishaku-flow-table { margin-bottom: 14px; }
+    .taishaku-flow-table table { width: auto; font-size: .84rem; }
+    .taishaku-flow-table td { padding: 5px 14px 5px 0; border-bottom: 0; text-align: left; white-space: nowrap; }
+    .taishaku-flow-table td:first-child { color: var(--muted); }
+    /* 独立クラス方式(増分11後半reviewer指摘Aと同じ理由): .chart-wrapを継承せずheightを明示固定する */
+    .taishaku-chart-wrap { position: relative; width: 100%; height: 100px; margin-bottom: 4px; }
+    .taishaku-chart-wrap canvas { display: block; width: 100%; height: 100px; }
+
+    .chart-wrap { position: relative; width: 100%; min-height: 320px; }
+    #series-chart { display: block; width: 100%; height: 320px; }
+
+    .visually-hidden {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      margin: -1px;
+      padding: 0;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    .signal-card { padding: 16px clamp(16px, 4vw, 24px); }
+    .signal-status-text { margin: 12px 0 0; color: var(--text); font-size: .96rem; line-height: 1.65; }
+    .signal-price-compare {
+      margin: 10px 0 0;
+      padding: 9px 12px;
+      border-left: 3px solid var(--series-price);
+      border-radius: 4px 9px 9px 4px;
+      background: rgba(185, 138, 245, .08);
+      color: #d7c4fb;
+      font-size: .86rem;
+    }
+    details.detail-note { margin-top: 14px; color: var(--muted); font-size: .8rem; }
+    details.detail-note summary {
+      cursor: pointer;
+      color: var(--text);
+      font-weight: 650;
+      font-size: .84rem;
+    }
+    details.detail-note summary::marker { color: var(--muted); }
+    details.detail-note p { margin: 8px 0 0; }
+    details.detail-note p + p { margin-top: 6px; }
+    .signal-badge {
+      display: inline-block;
+      padding: 5px 14px;
+      border-radius: 999px;
+      font-size: .82rem;
+      font-weight: 700;
+      letter-spacing: .02em;
+    }
+    .signal-badge.badge-orange { border: 1px solid rgba(240, 179, 76, .5); background: rgba(240, 179, 76, .14); color: #ffcf8a; }
+    .signal-badge.badge-blue { border: 1px solid rgba(115, 169, 223, .5); background: rgba(115, 169, 223, .14); color: #aed2f4; }
+    .signal-badge.badge-gray { border: 1px solid rgba(154, 171, 185, .4); background: rgba(154, 171, 185, .12); color: var(--muted); }
+    .signal-evidence { margin: 12px 0 6px; color: var(--text); font-size: .92rem; }
+    .signal-note { margin: 0; color: var(--muted); font-size: .76rem; }
+
+    .confidence-tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0 0; }
+    .confidence-tag {
+      display: inline-block;
+      padding: 3px 10px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface-2);
+      color: var(--muted);
+      font-size: .72rem;
+    }
+    .confidence-tags-link { display: inline-block; margin-top: 8px; color: var(--decrease); font-size: .78rem; text-decoration: none; }
+    .confidence-tags-link:hover { text-decoration: underline; }
+
+    .issue-heading-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+    .watch-toggle-btn, .watch-remove-btn {
+      padding: 8px 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface-2);
+      color: var(--text);
+      font-size: .82rem;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+    .watch-toggle-btn-active { border-color: var(--decrease); color: #bce4d1; }
+    .watch-toggle-btn:disabled { opacity: .5; cursor: not-allowed; }
+    .watch-limit-note { margin: 6px 0 0; color: var(--increase); font-size: .76rem; text-align: right; }
+
+    .watch-count-link {
+      display: inline-flex;
+      margin-bottom: 14px;
+      padding: 10px 14px;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface);
+      color: var(--text);
+      font-size: .86rem;
+      text-decoration: none;
+    }
+    .watch-count-link:hover { border-color: var(--decrease); }
+    .guide-link-inline { color: var(--decrease); text-decoration: none; }
+    .guide-link-inline:hover { text-decoration: underline; }
+
+    .watch-list { display: grid; margin: 0; padding: 0; gap: 10px; list-style: none; }
+    .watch-item { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+    .watch-item-retired { opacity: .8; padding: 14px 16px; }
+    .watch-item-link { display: block; padding: 14px 16px; color: inherit; text-decoration: none; }
+    .watch-item-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+    .watch-item-name { font-weight: 700; }
+    .watch-item-evidence { margin: 8px 0 0; color: var(--muted); font-size: .84rem; }
+    .watch-item-note { margin: 6px 0 10px; color: var(--muted); font-size: .84rem; }
+    .watch-change-badge {
+      display: inline-block;
+      margin: 0 0 8px;
+      padding: 3px 10px;
+      border: 1px solid rgba(240, 179, 76, .45);
+      border-radius: 999px;
+      background: rgba(240, 179, 76, .16);
+      color: #ffcf8a;
+      font-size: .74rem;
+      font-weight: 700;
+    }
+    .watch-no-change { margin: 0 0 12px; color: var(--muted); font-size: .86rem; }
+
+    .glossary-table th, .glossary-table td { text-align: left; white-space: normal; vertical-align: top; }
+    .glossary-table th:first-child, .glossary-table td:first-child { width: 8em; font-weight: 700; }
+    .guide-list { margin: 0 0 4px 1.15em; padding: 0; color: var(--text); }
+    .guide-list li { margin-bottom: 6px; }
+    .guide-section h2 { font-size: 1.05rem; }
+    .guide-section p { color: var(--text); }
+    .guide-section p + p { margin-top: 8px; }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { padding: 11px 10px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+    th { color: var(--muted); font-size: .74rem; font-weight: 600; }
+    th:first-child, td:first-child { padding-left: 0; text-align: left; }
+    td { font-size: .88rem; }
+    tbody tr:last-child td { border-bottom: 0; }
+    .unit { display: block; color: var(--muted); font-size: .7rem; font-weight: 400; }
+    .delta-up { color: var(--increase); font-weight: 700; }
+    .delta-down { color: var(--decrease); font-weight: 700; }
+    .delta-flat, .missing { color: var(--muted); }
+
+    .note {
+      margin: 16px 0 0;
+      padding: 13px 15px;
+      border-left: 3px solid var(--warning);
+      border-radius: 4px 9px 9px 4px;
+      background: rgba(240, 179, 76, .07);
+      color: #cbd5dd;
+      font-size: .84rem;
+    }
+
+    .status-card { padding: 34px 20px; color: var(--muted); text-align: center; }
+    .error { border-color: rgba(232, 93, 74, .45); color: #ffc5bd; }
+
+    footer {
+      padding: 20px 0 calc(20px + env(safe-area-inset-bottom));
+      border-top: 1px solid var(--border);
+      background: #080d12;
+      color: var(--muted);
+      font-size: .74rem;
+    }
+
+    footer p { margin: 0; }
+    footer p + p { margin-top: 3px; }
+
+    @media (max-width: 560px) {
+      .header-inner, main, .footer-inner { width: min(100% - 24px, 980px); }
+      .header-tag { display: none; }
+      main { padding-top: 18px; }
+      .hero { padding-top: 18px; }
+      .issue-heading { display: block; }
+      .issue-heading .issue-code { display: block; margin-top: 4px; }
+      .issue-heading-meta { align-items: flex-start; margin-top: 10px; }
+      .glossary-table th:first-child, .glossary-table td:first-child { width: 6em; }
+      .card { padding: 15px; }
+      .chart-wrap, #series-chart { min-height: 280px; height: 280px; }
+      th, td { padding-inline: 7px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="site-shell">
+    <header class="site-header">
+      <div class="header-inner">
+        <a class="brand" href="#/" aria-label="需給ナビ 検索へ"><span class="brand-mark">需給</span>ナビ</a>
+        <span class="header-tag">JSDA WEEKLY DATA</span>
+      </div>
+    </header>
+
+    <main id="app" aria-live="polite">
+      <div class="card status-card">データを読み込んでいます…</div>
+    </main>
+
+    <footer>
+      <div class="footer-inner">
+        <p>本アプリは研究・分析ツールであり投資助言ではありません。売買判断はご自身で。</p>
+        <p>データ出典: 日本証券業協会</p>
+      </div>
+    </footer>
+  </div>
+
+  <script>
+    'use strict';
+
+    // CONST / UTIL
+    const DATA_PATHS = Object.freeze({
+      meta: 'data/meta.json',
+      issues: 'data/issues.json',
+      series: function (shard) { return 'data/series/' + shard + '.json'; },
+      short: function (shard) { return 'data/short/' + shard + '.json'; },
+      shortMeta: 'data/short_meta.json',
+      prices: function (code) { return 'data/prices/' + code + '.json'; },
+      taishakuSeries: function (shard) { return 'data/taishaku_series/' + shard + '.json'; }
+    });
+    const SHORT_HISTORY_LIMIT = 20;
+    const SERIES = Object.freeze([
+      { key: 'lend_qty', label: '貸付残高', color: '#E85D4A' },
+      { key: 'own_qty', label: '借入（自己）', color: '#E6B85C' },
+      { key: 'ten_qty', label: '借入（転貸）', color: '#73A9DF' }
+    ]);
+    const PRICE_SERIES = Object.freeze({ key: 'price', label: '株価（週次終値・右軸）', color: '#B98AF5' });
+    const TABLE_ROWS = Object.freeze([
+      { key: 'lend_qty', label: '貸付残高', unit: '株' },
+      { key: 'own_qty', label: '借入（自己）', unit: '株' },
+      { key: 'ten_qty', label: '借入（転貸）', unit: '株' },
+      { key: 'lend_amt', label: '貸付金額', unit: '百万円' }
+    ]);
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const RESULT_LIMIT = 60;
+    const NUMBER_FORMAT = new Intl.NumberFormat('ja-JP');
+
+    // SIGNAL card thresholds (design.md §6、確定仕様)
+    const BORROW_CHANGE_THRESHOLD = 0.10; // 借株残4週変化率 ±10%
+    const SHORT_RATIO_THRESHOLD_PT = 0.5; // 空売り合計ratio 4週前比 ±0.5pt
+    const MIN_VALID_WEEKS = 8; // 有効週数（借株残が非nullの週）がこれ未満なら「データ不足」
+    const PERCENTILE_BAND = 20; // 上位/下位20%
+    const PRICE_CHANGE_THRESHOLD = 0.05; // 株価週足4週変化率 ±5%でup/down判定(増分5.1)
+    const PRICE_TREND_MIN_POINTS = 5; // 株価週足の非null本数がこれ未満なら株価照らし合わせ行を非表示
+    const SHORT_MARKER_THRESHOLD_PT = 0.1; // 空売りイベントマーカー: 前週末比 ±0.1ptで▲▽判定(増分10)
+    const SHORT_MARKER_LIST_LIMIT = 5; // 明細リストの直近件数
+    const FLOW_SURGE_PERCENTILE = 90; // 週次フロー(s_borrow_qty): 収録期間内で90パーセンタイル以上を急増週(増分11後半)
+    const FLOW_SURGE_RECENT_WEEKS = 8; // 直近何週以内に急増週があれば段ヘッダに「フロー急増」タグを出すか
+    const FLOW_BAR_COLOR = '#6C93A6'; // 既存系列(赤橙・黄・青・紫)と被らない落ち着いた色
+    const FLOW_SURGE_COLOR = '#F0B34C'; // 急増週の橙。badge-orange/空売りマーカー▲と同系統
+
+    // 増分9: ウォッチリスト(v2-policy.md 設計警告7の契約)。端末間同期なし・localStorageのみ
+    const WATCHLIST_KEY = 'jukyu_watchlist_v1';
+    const WATCHLIST_LIMIT = 50;
+    const SEEN_KEY = 'jukyu_watch_seen_v1';
+    const BADGE_LABELS = Object.freeze({
+      'pressure-up': '売り圧力 積み上がり',
+      'covering': '買い戻し進行',
+      'neutral': '中立',
+      'insufficient': 'データ不足'
+    });
+
+    function escapeHtml(value) {
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function normalizeSearch(value) {
+      const text = String(value || '');
+      return (typeof text.normalize === 'function' ? text.normalize('NFKC') : text)
+        .toLocaleLowerCase('ja-JP')
+        .replace(/\s+/g, '');
+    }
+
+    function parseYmd(value) {
+      const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''));
+      if (!match) return null;
+      const year = Number(match[1]);
+      const month = Number(match[2]);
+      const day = Number(match[3]);
+      const date = new Date(year, month - 1, day);
+      if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) return null;
+      return date;
+    }
+
+    function daysSinceYmd(value) {
+      const target = parseYmd(value);
+      if (!target) return null;
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      return Math.floor((today.getTime() - target.getTime()) / DAY_MS);
+    }
+
+    function shortDate(value) {
+      const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''));
+      return match ? Number(match[2]) + '/' + Number(match[3]) : '—';
+    }
+
+    function pad2(value) {
+      return value < 10 ? '0' + value : String(value);
+    }
+
+    // "YYYY-MM-DD" を数値化してDate.UTCで扱う(new Date(文字列)は使わない)。
+    // その週(月〜日)の月曜日を"YYYY-MM-DD"で返す。JSDA週(金曜・祝日週は木曜)と
+    // 株価週足(月曜起点)を同じ週同士で対応させるためのキー。
+    function mondayKeyOf(value) {
+      const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''));
+      if (!match) return null;
+      const year = Number(match[1]);
+      const month = Number(match[2]);
+      const day = Number(match[3]);
+      const utcMs = Date.UTC(year, month - 1, day);
+      const dayOfWeek = new Date(utcMs).getUTCDay(); // 0=日 .. 6=土
+      const offsetDays = (dayOfWeek + 6) % 7; // 月曜からの経過日数
+      const monday = new Date(utcMs - offsetDays * DAY_MS);
+      return monday.getUTCFullYear() + '-' + pad2(monday.getUTCMonth() + 1) + '-' + pad2(monday.getUTCDate());
+    }
+
+    function addDaysToYmd(value, deltaDays) {
+      const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''));
+      if (!match) return null;
+      const year = Number(match[1]);
+      const month = Number(match[2]);
+      const day = Number(match[3]);
+      const shifted = new Date(Date.UTC(year, month - 1, day) + deltaDays * DAY_MS);
+      return shifted.getUTCFullYear() + '-' + pad2(shifted.getUTCMonth() + 1) + '-' + pad2(shifted.getUTCDate());
+    }
+
+    function isNumber(value) {
+      return typeof value === 'number' && Number.isFinite(value);
+    }
+
+    function formatNumber(value) {
+      return isNumber(value) ? NUMBER_FORMAT.format(value) : '—';
+    }
+
+    function formatCompact(value) {
+      if (!isNumber(value)) return '—';
+      const absolute = Math.abs(value);
+      if (absolute >= 100000000) return (value / 100000000).toFixed(absolute >= 1000000000 ? 0 : 1) + '億';
+      if (absolute >= 10000) return (value / 10000).toFixed(absolute >= 100000 ? 0 : 1) + '万';
+      return NUMBER_FORMAT.format(Math.round(value));
+    }
+
+    function getRoute() {
+      if (location.hash === '#/watch') return { type: 'watch' };
+      if (location.hash === '#/guide') return { type: 'guide' };
+      const match = /^#\/issue\/([^/?#]+)$/.exec(location.hash);
+      if (!match) return { type: 'search' };
+      try {
+        return { type: 'issue', code: decodeURIComponent(match[1]).toUpperCase() };
+      } catch (error) {
+        return { type: 'search' };
+      }
+    }
+
+    // STATE
+    const state = {
+      meta: null,
+      metaError: null,
+      issues: [],
+      issueByCode: Object.create(null),
+      issuesError: null,
+      query: '',
+      route: { type: 'search' },
+      seriesCache: new Map(),
+      shortCache: new Map(),
+      pricesCache: new Map(),
+      taishakuCache: new Map(),
+      shortMeta: null,
+      shortMetaFetched: false,
+      currentChart: null,
+      currentTaishakuChart: null,
+      routeRequest: 0,
+      resizeFrame: 0
+    };
+
+    // WATCHLIST(増分9。localStorageのみ・端末間同期なし・寛容パース。
+    // v2-policy.md 設計警告7: 上限件数・schema_version・廃止銘柄の扱い・同期なしを明記する契約)
+    function loadWatchlist() {
+      try {
+        const raw = localStorage.getItem(WATCHLIST_KEY);
+        if (!raw) return { schema_version: 1, codes: [] };
+        const parsed = JSON.parse(raw);
+        const codes = parsed && Array.isArray(parsed.codes)
+          ? parsed.codes.filter(function (code) { return typeof code === 'string' && code; })
+          : [];
+        return { schema_version: 1, codes: codes };
+      } catch (error) {
+        return { schema_version: 1, codes: [] };
+      }
+    }
+
+    function saveWatchlist(watchlist) {
+      try {
+        localStorage.setItem(WATCHLIST_KEY, JSON.stringify({ schema_version: 1, codes: watchlist.codes }));
+      } catch (error) {
+        // localStorageが使えない(プライベートモード・容量超過等)場合は静かに諦める。
+        // UIには反映されないが例外は投げない(表示専用アプリの方針を踏襲)
+      }
+    }
+
+    function isWatched(code) {
+      return loadWatchlist().codes.indexOf(code) !== -1;
+    }
+
+    // 追加: 重複防止・上限50件。上限超過時は{ok:false, reason:'limit'}を返す(呼び出し側でメッセージ表示)
+    function addToWatchlist(code) {
+      const watchlist = loadWatchlist();
+      if (watchlist.codes.indexOf(code) !== -1) return { ok: true, watchlist: watchlist };
+      if (watchlist.codes.length >= WATCHLIST_LIMIT) return { ok: false, reason: 'limit', watchlist: watchlist };
+      watchlist.codes.push(code);
+      saveWatchlist(watchlist);
+      return { ok: true, watchlist: watchlist };
+    }
+
+    function removeFromWatchlist(code) {
+      const watchlist = loadWatchlist();
+      const index = watchlist.codes.indexOf(code);
+      if (index === -1) return watchlist;
+      watchlist.codes.splice(index, 1);
+      saveWatchlist(watchlist);
+      return watchlist;
+    }
+
+    // 週次差分ダイジェスト用の「前回閲覧時の値」。#/watch描画完了時に現在値で上書きする
+    function loadSeen() {
+      try {
+        const raw = localStorage.getItem(SEEN_KEY);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        return (parsed && parsed.seen && typeof parsed.seen === 'object') ? parsed.seen : {};
+      } catch (error) {
+        return {};
+      }
+    }
+
+    function saveSeen(seen) {
+      try {
+        localStorage.setItem(SEEN_KEY, JSON.stringify({ schema_version: 1, seen: seen }));
+      } catch (error) {
+        // 同上、静かに諦める
+      }
+    }
+
+    // 確度ラベル(design.md増分9 (c)。銘柄ページ・watchカード共通)
+    function buildConfidenceTags(hasPrices, shortStatus) {
+      const tags = [];
+      if (!hasPrices) tags.push('株価データなし');
+      if (shortStatus === 'none') tags.push('大口空売り非開示圏(0.5%未満は公表されません)');
+      tags.push('一般貸借のみ(JSDA)');
+      return tags;
+    }
+
+    // タグ行のみ(リンクなし)。ウォッチカードのように既に外側が<a>の中はネストできないため専用に分ける
+    function confidenceTagsOnlyHtml(hasPrices, shortStatus) {
+      const tags = buildConfidenceTags(hasPrices, shortStatus);
+      return '<div class="confidence-tags">' +
+        tags.map(function (tag) { return '<span class="confidence-tag">' + escapeHtml(tag) + '</span>'; }).join('') +
+        '</div>';
+    }
+
+    // タグ+ガイドへのリンク。銘柄ページのシグナルカードなど、他に<a>を含まない文脈専用
+    // (reviewer指摘A: watch-item-link<a>の中でこれを使うとアンカーが入れ子になり、
+    // ブラウザが外側aを暗黙的に閉じてレイアウトが崩れる。watchカードではconfidenceTagsOnlyHtmlを使うこと)
+    function confidenceTagsHtml(hasPrices, shortStatus) {
+      return confidenceTagsOnlyHtml(hasPrices, shortStatus) +
+        '<a class="confidence-tags-link" href="#/guide">タグの意味を用語ガイドで見る →</a>';
+    }
+
+    // 銘柄ページのウォッチ登録ボタン(差分DOMパッチ対象。#watch-toggle-wrap の中身だけ更新する)
+    function watchButtonHtml(code) {
+      const watchlist = loadWatchlist();
+      const watched = watchlist.codes.indexOf(code) !== -1;
+      if (watched) {
+        return '<button type="button" class="watch-toggle-btn watch-toggle-btn-active" data-watch-toggle="' + escapeHtml(code) + '">★追加済み（タップで解除）</button>';
+      }
+      if (watchlist.codes.length >= WATCHLIST_LIMIT) {
+        return '<button type="button" class="watch-toggle-btn" data-watch-toggle="' + escapeHtml(code) + '" disabled>☆ウォッチに追加</button>' +
+          '<p class="watch-limit-note">上限50件です</p>';
+      }
+      return '<button type="button" class="watch-toggle-btn" data-watch-toggle="' + escapeHtml(code) + '">☆ウォッチに追加</button>';
+    }
+
+    function refreshWatchButton(code) {
+      const wrap = document.getElementById('watch-toggle-wrap');
+      if (wrap) wrap.innerHTML = watchButtonHtml(code);
+    }
+
+    function toggleWatch(code) {
+      if (isWatched(code)) {
+        removeFromWatchlist(code);
+      } else {
+        addToWatchlist(code); // 上限到達時はaddが何もせず{ok:false}を返す。ボタンは再描画で無効表示のまま
+      }
+      refreshWatchButton(code);
+    }
+
+    // DATA (fetch)
+    async function fetchJson(path) {
+      if (!/^data\/[A-Za-z0-9_./-]+\.json$/.test(path)) throw new Error('許可されていないデータパスです。');
+      const response = await fetch(path, { headers: { Accept: 'application/json' } });
+      if (!response.ok) throw new Error(path + ' の取得に失敗しました (' + response.status + ')');
+      return response.json();
+    }
+
+    async function loadMeta() {
+      const payload = await fetchJson(DATA_PATHS.meta);
+      if (!payload || typeof payload.latest_week !== 'string') throw new Error('meta.json の形式が不正です。');
+      state.meta = payload;
+    }
+
+    async function loadIssues() {
+      const payload = await fetchJson(DATA_PATHS.issues);
+      if (!payload || !payload.issues || typeof payload.issues !== 'object') throw new Error('issues.json の形式が不正です。');
+      state.issueByCode = payload.issues;
+      state.issues = Object.keys(payload.issues).map(function (code) {
+        const item = payload.issues[code] || {};
+        return {
+          code: code,
+          name: typeof item.name === 'string' ? item.name : code,
+          shard: typeof item.shard === 'string' ? item.shard : '',
+          searchText: normalizeSearch(code + ' ' + (item.name || ''))
+        };
+      });
+    }
+
+    async function loadSeries(shard) {
+      if (!/^[A-Za-z0-9_-]+$/.test(shard)) throw new Error('shard名が不正です。');
+      if (state.seriesCache.has(shard)) return state.seriesCache.get(shard);
+      const payload = await fetchJson(DATA_PATHS.series(shard));
+      if (!payload || !Array.isArray(payload.weeks) || !payload.issues || typeof payload.issues !== 'object') {
+        throw new Error('時系列データの形式が不正です。');
+      }
+      state.seriesCache.set(shard, payload);
+      return payload;
+    }
+
+    async function loadShortShard(shard) {
+      if (!/^[A-Za-z0-9_-]+$/.test(shard)) throw new Error('shard名が不正です。');
+      if (state.shortCache.has(shard)) return state.shortCache.get(shard);
+      const response = await fetch(DATA_PATHS.short(shard), { headers: { Accept: 'application/json' } });
+      if (response.status === 404) {
+        state.shortCache.set(shard, null);
+        return null;
+      }
+      if (!response.ok) throw new Error('空売りデータの取得に失敗しました (' + response.status + ')');
+      const payload = await response.json();
+      if (!payload || !payload.issues || typeof payload.issues !== 'object') throw new Error('空売りデータの形式が不正です。');
+      state.shortCache.set(shard, payload);
+      return payload;
+    }
+
+    async function loadShortMeta() {
+      if (state.shortMetaFetched) return state.shortMeta;
+      state.shortMetaFetched = true;
+      try {
+        const payload = await fetchJson(DATA_PATHS.shortMeta);
+        if (payload && typeof payload.latest_short_date === 'string') state.shortMeta = payload;
+      } catch (error) {
+        state.shortMeta = null;
+      }
+      return state.shortMeta;
+    }
+
+    async function loadPrices(code) {
+      if (!/^[A-Za-z0-9]+$/.test(code)) throw new Error('銘柄コードが不正です。');
+      if (state.pricesCache.has(code)) return state.pricesCache.get(code);
+      const response = await fetch(DATA_PATHS.prices(code), { headers: { Accept: 'application/json' } });
+      if (response.status === 404) {
+        state.pricesCache.set(code, null);
+        return null;
+      }
+      if (!response.ok) throw new Error('株価データの取得に失敗しました (' + response.status + ')');
+      const payload = await response.json();
+      if (!payload || !payload.weekly || typeof payload.weekly !== 'object') throw new Error('株価データの形式が不正です。');
+      state.pricesCache.set(code, payload);
+      return payload;
+    }
+
+    // 増分14b: 日証金(制度信用)カード用データ。404・shardにコードなし・fetch失敗は
+    // すべて「カード非表示」に倒す(日証金レーンは収集開始直後でデータが薄いため、
+    // エラー表示は出さない設計)。404はnullを返し、それ以外の失敗は呼び出し側にthrowする
+    async function loadTaishakuSeries(shard) {
+      if (!/^[A-Za-z0-9_-]+$/.test(shard)) throw new Error('shard名が不正です。');
+      if (state.taishakuCache.has(shard)) return state.taishakuCache.get(shard);
+      const response = await fetch(DATA_PATHS.taishakuSeries(shard), { headers: { Accept: 'application/json' } });
+      if (response.status === 404) {
+        state.taishakuCache.set(shard, null);
+        return null;
+      }
+      if (!response.ok) throw new Error('日証金データの取得に失敗しました (' + response.status + ')');
+      const payload = await response.json();
+      if (!payload || !Array.isArray(payload.dates) || !payload.issues || typeof payload.issues !== 'object') {
+        throw new Error('日証金データの形式が不正です。');
+      }
+      state.taishakuCache.set(shard, payload);
+      return payload;
+    }
+
+    // JSDA週(weeks配列。金曜、祝日週は木曜)に、株価週足(月曜起点)を同じ週(月〜日)で対応させる。
+    // 対応する週の終値が無ければnull(チャートはギャップとして線を切る)。
+    function buildPriceWeekMap(prices) {
+      const map = Object.create(null);
+      const weekly = prices && prices.weekly;
+      const dates = weekly && Array.isArray(weekly.dates) ? weekly.dates : [];
+      const closes = weekly && Array.isArray(weekly.close) ? weekly.close : [];
+      dates.forEach(function (date, index) {
+        const key = mondayKeyOf(date);
+        const value = closes[index];
+        if (key && isNumber(value)) map[key] = value;
+      });
+      return map;
+    }
+
+    function alignPricesToWeeks(weeks, priceMap) {
+      return weeks.map(function (week) {
+        const key = mondayKeyOf(week);
+        const value = key ? priceMap[key] : undefined;
+        return isNumber(value) ? value : null;
+      });
+    }
+
+    function latestDailyPrice(prices) {
+      const daily = prices && prices.daily;
+      const dates = daily && Array.isArray(daily.dates) ? daily.dates : [];
+      if (!dates.length) return null;
+      const lastIndex = dates.length - 1;
+      const closes = daily && Array.isArray(daily.close) ? daily.close : [];
+      return { date: dates[lastIndex], close: closes[lastIndex] };
+    }
+
+    function formatRatioPercent(value) {
+      if (!isNumber(value)) return '—';
+      return (Math.round(value * 10000) / 100).toFixed(2) + '%';
+    }
+
+    // 増分10.5(design.md §4「報告終了イベント」): 実際の報告ratioは常に0.5%以上のため、
+    // 合計値が厳密に0になるのは「収録中の報告者が全員below_threshold(0.5%未満に低下)」の
+    // 場合のみ(通常の空売りが本当にゼロという意味ではない)。合計系の表示にだけ使う
+    function formatShortSumPercent(value) {
+      if (isNumber(value) && value === 0) return '0.5%未満';
+      return formatRatioPercent(value);
+    }
+
+    // 報告者ごとの1件の表示。below_threshold(そのイベント単体が「0.5%未満に低下」を表す
+    // 合成イベント)は「0.00%」ではなく低下日付つきで表示する。qtyはnullなのでformatNumberが
+    // 既存の挙動で「—」を返す(変更不要)
+    function formatShortRatioCell(event) {
+      if (event && event.below_threshold) return '0.5%未満に低下(' + shortDate(event.date) + ')';
+      return formatRatioPercent(event ? event.ratio : null);
+    }
+
+    function shortSellerRows(events) {
+      const bySeller = Object.create(null);
+      events.forEach(function (event) {
+        const current = bySeller[event.seller];
+        if (!current || String(event.date) > String(current.date)) bySeller[event.seller] = event;
+      });
+      return Object.keys(bySeller).map(function (seller) { return bySeller[seller]; })
+        .sort(function (a, b) { return (b.ratio || 0) - (a.ratio || 0); });
+    }
+
+    function renderShortData(target, issue, metaLine) {
+      const events = (issue && Array.isArray(issue.events)) ? issue.events.filter(function (event) {
+        return event && typeof event.seller === 'string' && typeof event.date === 'string';
+      }) : [];
+      if (!events.length) {
+        target.innerHTML =
+          '<section class="card" aria-labelledby="short-title">' +
+            '<h2 id="short-title">大口空売り残高報告（0.5%以上）</h2>' + metaLine +
+            '<p class="section-subtitle">大口空売り報告なし（発行済株式の0.5%以上の報告対象外）</p>' +
+          '</section>';
+        return;
+      }
+      const sellers = shortSellerRows(events);
+      const sellerRows = sellers.map(function (event) {
+        return '<tr>' +
+          '<td>' + escapeHtml(event.seller) + '</td>' +
+          '<td>' + escapeHtml(event.date) + '</td>' +
+          '<td>' + escapeHtml(formatShortRatioCell(event)) + '</td>' +
+          '<td>' + formatNumber(event.qty) + '</td>' +
+        '</tr>';
+      }).join('');
+      const history = events.slice().sort(function (a, b) {
+        return a.date === b.date ? (a.seller < b.seller ? -1 : 1) : (a.date < b.date ? 1 : -1);
+      }).slice(0, SHORT_HISTORY_LIMIT).map(function (event) {
+        return '<tr>' +
+          '<td>' + escapeHtml(event.date) + '</td>' +
+          '<td>' + escapeHtml(event.seller) + '</td>' +
+          '<td>' + escapeHtml(formatShortRatioCell(event)) + '</td>' +
+          '<td>' + formatNumber(event.qty) + '</td>' +
+        '</tr>';
+      }).join('');
+      target.innerHTML =
+        '<section class="card" aria-labelledby="short-title">' +
+          '<h2 id="short-title">大口空売り残高報告（0.5%以上）</h2>' + metaLine +
+          '<p class="section-subtitle">発行済株式の0.5%以上を空売りしている機関の一覧です。割合が下がってきていれば買い戻しが進んでいます。</p>' +
+          '<p class="section-subtitle">報告者別の最新状況（割合は発行済株式数に対する空売り残高）</p>' +
+          '<div class="table-wrap"><table>' +
+            '<thead><tr><th scope="col">報告者</th><th scope="col">計算日</th><th scope="col">割合</th><th scope="col">数量（株）</th></tr></thead>' +
+            '<tbody>' + sellerRows + '</tbody>' +
+          '</table></div>' +
+          '<p class="section-subtitle">報告履歴（直近' + SHORT_HISTORY_LIMIT + '件）</p>' +
+          '<div class="table-wrap"><table>' +
+            '<thead><tr><th scope="col">計算日</th><th scope="col">報告者</th><th scope="col">割合</th><th scope="col">数量（株）</th></tr></thead>' +
+            '<tbody>' + history + '</tbody>' +
+          '</table></div>' +
+          '<p class="note">出典: 日本取引所グループ「空売り残高に関する情報」。0.5%未満へ減少した後の状況は報告されない点に注意</p>' +
+        '</section>';
+    }
+
+    async function renderShortSection(code, requestId, shardPromise) {
+      const target = document.getElementById('short-content');
+      if (!target) return;
+      try {
+        const results = await Promise.all([shardPromise, loadShortMeta()]);
+        if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
+        const shard = results[0];
+        const metaLine = state.shortMeta ? '<p class="section-subtitle">最新公表日: ' + escapeHtml(state.shortMeta.latest_short_date) + '</p>' : '';
+        const issue = shard && shard.issues ? shard.issues[code] : null;
+        renderShortData(target, issue, metaLine);
+      } catch (error) {
+        if (requestId !== state.routeRequest) return;
+        const current = document.getElementById('short-content');
+        if (current) current.innerHTML = '<div class="card status-card">空売りデータを取得できません。</div>';
+      }
+    }
+
+    // TAISHAKU(日証金・制度信用カード。増分14b。design.md §6「日証金カード」)
+    const TAISHAKU_CHART_MIN_DATES = 5; // これ未満(非null日数)なら小チャートを出さない
+
+    // 前日値が非nullの場合のみ差分文字列を返す(nullなら前日比自体を出さない=呼び出し側でnullチェック)
+    function formatSignedDelta(current, previous) {
+      if (!isNumber(current) || !isNumber(previous)) return null;
+      const delta = current - previous;
+      const prefix = delta > 0 ? '+' : '';
+      return prefix + formatNumber(delta);
+    }
+
+    function taishakuDeltaClass(current, previous) {
+      if (!isNumber(current) || !isNumber(previous)) return '';
+      const delta = current - previous;
+      return delta > 0 ? 'delta-up' : (delta < 0 ? 'delta-down' : 'delta-flat');
+    }
+
+    function taishakuMetricHtml(label, value, previous) {
+      const deltaText = formatSignedDelta(value, previous);
+      const deltaHtml = deltaText ? '<span class="taishaku-metric-delta ' + taishakuDeltaClass(value, previous) + '">前日比 ' + escapeHtml(deltaText) + '</span>' : '';
+      return '<div class="taishaku-metric">' +
+        '<span class="taishaku-metric-label">' + escapeHtml(label) + '</span>' +
+        '<span class="taishaku-metric-value">' + formatNumber(value) + '</span>' +
+        deltaHtml +
+      '</div>';
+    }
+
+    function renderTaishakuCard(target, code, dates, issueData) {
+      const yushiZan = Array.isArray(issueData.yushi_zan) ? issueData.yushi_zan : [];
+      const kashikabuZan = Array.isArray(issueData.kashikabu_zan) ? issueData.kashikabu_zan : [];
+      const sashihikiZan = Array.isArray(issueData.sashihiki_zan) ? issueData.sashihiki_zan : [];
+      const yushiShin = Array.isArray(issueData.yushi_shin) ? issueData.yushi_shin : [];
+      const yushiHen = Array.isArray(issueData.yushi_hen) ? issueData.yushi_hen : [];
+      const kashikabuShin = Array.isArray(issueData.kashikabu_shin) ? issueData.kashikabu_shin : [];
+      const kashikabuHen = Array.isArray(issueData.kashikabu_hen) ? issueData.kashikabu_hen : [];
+
+      const latestIndex = dates.length - 1;
+      const previousIndex = latestIndex - 1;
+      if (latestIndex < 0) { target.innerHTML = ''; return; } // dates空はカード非表示(仕様の「銘柄未収録」相当)
+      const latestDate = dates[latestIndex];
+
+      const latestYushi = yushiZan[latestIndex];
+      const latestKashikabu = kashikabuZan[latestIndex];
+      const latestSashihiki = sashihikiZan[latestIndex];
+      const prevYushi = previousIndex >= 0 ? yushiZan[previousIndex] : null;
+      const prevKashikabu = previousIndex >= 0 ? kashikabuZan[previousIndex] : null;
+      const prevSashihiki = previousIndex >= 0 ? sashihikiZan[previousIndex] : null;
+
+      const metricsHtml = taishakuMetricHtml('融資残（買い方）', latestYushi, prevYushi) +
+        taishakuMetricHtml('貸株残（売り方）', latestKashikabu, prevKashikabu) +
+        taishakuMetricHtml('差引', latestSashihiki, prevSashihiki);
+
+      const flowTableHtml =
+        '<div class="taishaku-flow-table">' +
+          '<p class="section-subtitle">当日のフロー（新規／返済）</p>' +
+          '<table>' +
+            '<tbody>' +
+              '<tr><td>融資</td><td>新規 ' + formatNumber(yushiShin[latestIndex]) + '</td><td>返済 ' + formatNumber(yushiHen[latestIndex]) + '</td></tr>' +
+              '<tr><td>貸株</td><td>新規 ' + formatNumber(kashikabuShin[latestIndex]) + '</td><td>返済 ' + formatNumber(kashikabuHen[latestIndex]) + '</td></tr>' +
+            '</tbody>' +
+          '</table>' +
+        '</div>';
+
+      const validDateCount = dates.filter(function (_, index) {
+        return isNumber(yushiZan[index]) || isNumber(kashikabuZan[index]);
+      }).length;
+      const hasChart = validDateCount >= TAISHAKU_CHART_MIN_DATES;
+      const chartHtml = hasChart
+        ? '<div class="taishaku-chart-wrap"><canvas id="taishaku-chart" role="img" aria-label="' + escapeHtml(code) + 'の日証金融資残・貸株残の推移">日証金推移チャート</canvas></div>'
+        : '';
+
+      target.innerHTML =
+        '<section class="card" aria-labelledby="taishaku-title">' +
+          '<h2 id="taishaku-title">日証金（制度信用）の貸借</h2>' +
+          '<p class="section-subtitle">最新日: ' + escapeHtml(latestDate) + '</p>' +
+          '<div class="taishaku-metrics">' + metricsHtml + '</div>' +
+          flowTableHtml +
+          chartHtml +
+          '<span class="confidence-tag">制度信用(日証金)のみ・東証銘柄</span>' +
+          '<p class="note">日証金(証券金融会社)を通じた制度信用取引の残高です。制度信用は主に個人投資家が使うため、上の貸借残高(機関側)と見比べると『機関と個人がそれぞれどちらに傾いているか』の目安になります。融資残=信用買いの残、貸株残=信用売りの残です。</p>' +
+        '</section>';
+
+      if (hasChart) {
+        state.currentTaishakuChart = { dates: dates, yushiZan: yushiZan, kashikabuZan: kashikabuZan };
+        drawTaishakuChart(document.getElementById('taishaku-chart'), dates, yushiZan, kashikabuZan);
+      } else {
+        state.currentTaishakuChart = null;
+      }
+    }
+
+    async function renderTaishakuSection(code, requestId, taishakuPromise) {
+      const target = document.getElementById('taishaku-content');
+      if (!target) return;
+      try {
+        const payload = await taishakuPromise;
+        if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
+        // 404(未収録)・shardにコードなしは、どちらもエラー表示を出さずカードごと非表示にする
+        // (日証金レーンは収集開始直後でデータが薄く、未収録は珍しくないため)
+        const issueData = payload && payload.issues ? payload.issues[code] : null;
+        if (!payload || !issueData) {
+          target.innerHTML = '';
+          state.currentTaishakuChart = null;
+          return;
+        }
+        const dates = Array.isArray(payload.dates) ? payload.dates : [];
+        renderTaishakuCard(target, code, dates, issueData);
+      } catch (error) {
+        if (requestId !== state.routeRequest) return;
+        // fetch失敗もカード非表示(エラー文言は出さない。design.md §6の明記通り)
+        const current = document.getElementById('taishaku-content');
+        if (current) current.innerHTML = '';
+        state.currentTaishakuChart = null;
+      }
+    }
+
+    // CHART
+    const SHORT_MARKER_UP_COLOR = '#F0B34C'; // badge-orange(積み上がり)と同系統
+    const SHORT_MARKER_DOWN_COLOR = '#73A9DF'; // badge-blue(買い戻し進行)と同系統
+
+    function drawChart(canvas, weeks, issue, priceValues, shortMarkers) {
+      if (!canvas || !canvas.getContext) return;
+      const context = canvas.getContext('2d');
+      if (!context) return;
+
+      const cssWidth = Math.max(280, Math.floor(canvas.getBoundingClientRect().width || canvas.parentElement.clientWidth || 600));
+      const cssHeight = canvas.clientHeight || 320;
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 3);
+      canvas.width = Math.floor(cssWidth * pixelRatio);
+      canvas.height = Math.floor(cssHeight * pixelRatio);
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      context.clearRect(0, 0, cssWidth, cssHeight);
+
+      const hasPrice = Array.isArray(priceValues) && priceValues.some(isNumber);
+      const hasMarkers = Array.isArray(shortMarkers) && shortMarkers.some(function (marker) { return marker; });
+      const bounds = { left: 58, right: hasPrice ? 56 : 14, top: 14, bottom: 34 + (hasMarkers ? 18 : 0) };
+      const plotWidth = Math.max(1, cssWidth - bounds.left - bounds.right);
+      const plotHeight = Math.max(1, cssHeight - bounds.top - bounds.bottom);
+      const values = [];
+      SERIES.forEach(function (series) {
+        const items = Array.isArray(issue[series.key]) ? issue[series.key] : [];
+        items.forEach(function (value) { if (isNumber(value)) values.push(value); });
+      });
+
+      if (!weeks.length || !values.length) {
+        context.fillStyle = '#9aabb9';
+        context.font = '13px -apple-system, sans-serif';
+        context.textAlign = 'center';
+        context.fillText('表示できる時系列データがありません', cssWidth / 2, cssHeight / 2);
+        return;
+      }
+
+      const maximum = Math.max.apply(null, values);
+      const yMaximum = maximum > 0 ? maximum * 1.08 : 1;
+      const xAt = function (index) {
+        return weeks.length === 1 ? bounds.left + plotWidth / 2 : bounds.left + plotWidth * index / (weeks.length - 1);
+      };
+      const yAt = function (value) { return bounds.top + plotHeight * (1 - value / yMaximum); };
+
+      // 株価用の右軸スケール(残高軸とは独立)
+      let priceMinimum = 0;
+      let priceMaximum = 1;
+      let priceYAt = null;
+      if (hasPrice) {
+        const validPrices = priceValues.filter(isNumber);
+        const rawMax = Math.max.apply(null, validPrices);
+        const rawMin = Math.min.apply(null, validPrices);
+        priceMaximum = rawMax > 0 ? rawMax * 1.05 : rawMax + 1;
+        priceMinimum = rawMin >= 0 ? rawMin * 0.95 : rawMin * 1.05;
+        if (priceMaximum <= priceMinimum) priceMaximum = priceMinimum + 1;
+        priceYAt = function (value) { return bounds.top + plotHeight * (1 - (value - priceMinimum) / (priceMaximum - priceMinimum)); };
+      }
+
+      context.lineWidth = 1;
+      context.font = '11px -apple-system, sans-serif';
+      context.textBaseline = 'middle';
+      for (let line = 0; line <= 4; line += 1) {
+        const ratio = line / 4;
+        const y = bounds.top + plotHeight * ratio;
+        context.strokeStyle = '#263545';
+        context.beginPath();
+        context.moveTo(bounds.left, y);
+        context.lineTo(cssWidth - bounds.right, y);
+        context.stroke();
+        context.fillStyle = '#8294a3';
+        context.textAlign = 'right';
+        context.fillText(formatCompact(yMaximum * (1 - ratio)), bounds.left - 8, y);
+        if (hasPrice) {
+          context.textAlign = 'left';
+          context.fillText(formatCompact(priceMaximum - (priceMaximum - priceMinimum) * ratio), cssWidth - bounds.right + 8, y);
+        }
+      }
+
+      SERIES.forEach(function (series) {
+        const items = Array.isArray(issue[series.key]) ? issue[series.key] : [];
+        let drawing = false;
+        context.beginPath();
+        items.forEach(function (value, index) {
+          if (!isNumber(value)) {
+            drawing = false;
+            return;
+          }
+          const x = xAt(index);
+          const y = yAt(value);
+          if (drawing) context.lineTo(x, y);
+          else context.moveTo(x, y);
+          drawing = true;
+        });
+        context.strokeStyle = series.color;
+        context.lineWidth = 2;
+        context.lineJoin = 'round';
+        context.lineCap = 'round';
+        context.stroke();
+
+        if (weeks.length <= 3) {
+          items.forEach(function (value, index) {
+            if (!isNumber(value)) return;
+            context.beginPath();
+            context.arc(xAt(index), yAt(value), 3.5, 0, Math.PI * 2);
+            context.fillStyle = series.color;
+            context.fill();
+          });
+        }
+      });
+
+      if (hasPrice && priceYAt) {
+        let drawing = false;
+        context.beginPath();
+        priceValues.forEach(function (value, index) {
+          if (!isNumber(value)) {
+            drawing = false;
+            return;
+          }
+          const x = xAt(index);
+          const y = priceYAt(value);
+          if (drawing) context.lineTo(x, y);
+          else context.moveTo(x, y);
+          drawing = true;
+        });
+        context.strokeStyle = PRICE_SERIES.color;
+        context.lineWidth = 2;
+        context.lineJoin = 'round';
+        context.lineCap = 'round';
+        context.stroke();
+
+        if (weeks.length <= 3) {
+          priceValues.forEach(function (value, index) {
+            if (!isNumber(value)) return;
+            context.beginPath();
+            context.arc(xAt(index), priceYAt(value), 3.5, 0, Math.PI * 2);
+            context.fillStyle = PRICE_SERIES.color;
+            context.fill();
+          });
+        }
+      }
+
+      if (hasMarkers) {
+        // 日付ラベル行のすぐ上に帯を設け、週位置(xAt)に合わせて▲▽を描く(増分10)
+        const markerY = cssHeight - bounds.bottom + 8;
+        context.font = '13px -apple-system, sans-serif';
+        context.textAlign = 'center';
+        context.textBaseline = 'middle';
+        shortMarkers.forEach(function (marker, index) {
+          if (!marker) return;
+          context.fillStyle = marker.direction === 'up' ? SHORT_MARKER_UP_COLOR : SHORT_MARKER_DOWN_COLOR;
+          context.fillText(marker.direction === 'up' ? '▲' : '▽', xAt(index), markerY);
+        });
+        context.font = '11px -apple-system, sans-serif'; // reviewer指摘B: x軸日付ラベル用のフォントサイズに戻す
+      }
+
+      const labelIndexes = weeks.length === 1 ? [0] : [0, Math.floor((weeks.length - 1) / 2), weeks.length - 1];
+      context.fillStyle = '#8294a3';
+      context.textBaseline = 'top';
+      labelIndexes.forEach(function (index, position) {
+        context.textAlign = position === 0 ? 'left' : (position === labelIndexes.length - 1 ? 'right' : 'center');
+        context.fillText(shortDate(weeks[index]), xAt(index), cssHeight - bounds.bottom + 10 + (hasMarkers ? 18 : 0));
+      });
+    }
+
+    // 週次フロー(s_borrow_qty)の棒グラフ。残高チャートとは別Canvas・別軸(v2-policy警告1: ストックと
+    // フローを同軸に重ねない)。週軸(xAt)は残高チャートと同じ計算式・同じbounds.left/rightを使い、
+    // 2枚のCanvasの週位置がピクセル単位で揃うようにする(hasPriceValuesで右余白を残高チャートと合わせる)
+    function drawFlowChart(canvas, weeks, values, surgeFlags, hasPriceValues) {
+      if (!canvas || !canvas.getContext) return;
+      const context = canvas.getContext('2d');
+      if (!context) return;
+
+      const cssWidth = Math.max(280, Math.floor(canvas.getBoundingClientRect().width || canvas.parentElement.clientWidth || 600));
+      const cssHeight = canvas.clientHeight || 120;
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 3);
+      canvas.width = Math.floor(cssWidth * pixelRatio);
+      canvas.height = Math.floor(cssHeight * pixelRatio);
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      context.clearRect(0, 0, cssWidth, cssHeight);
+
+      const bounds = { left: 58, right: hasPriceValues ? 56 : 14, top: 10, bottom: 20 };
+      const plotWidth = Math.max(1, cssWidth - bounds.left - bounds.right);
+      const plotHeight = Math.max(1, cssHeight - bounds.top - bounds.bottom);
+      const validValues = (values || []).filter(isNumber);
+
+      if (!weeks.length || !validValues.length) {
+        context.fillStyle = '#9aabb9';
+        context.font = '12px -apple-system, sans-serif';
+        context.textAlign = 'center';
+        context.fillText('表示できるデータがありません', cssWidth / 2, cssHeight / 2);
+        return;
+      }
+
+      const maximum = Math.max.apply(null, validValues);
+      const yMaximum = maximum > 0 ? maximum * 1.1 : 1;
+      const xAt = function (index) {
+        return weeks.length === 1 ? bounds.left + plotWidth / 2 : bounds.left + plotWidth * index / (weeks.length - 1);
+      };
+      const barWidth = weeks.length > 1 ? Math.max(1.5, (plotWidth / (weeks.length - 1)) * 0.6) : 6;
+
+      context.strokeStyle = '#263545';
+      context.lineWidth = 1;
+      context.font = '10px -apple-system, sans-serif';
+      context.textAlign = 'right';
+      context.textBaseline = 'middle';
+      for (let line = 0; line <= 2; line += 1) {
+        const ratio = line / 2;
+        const y = bounds.top + plotHeight * ratio;
+        context.beginPath();
+        context.moveTo(bounds.left, y);
+        context.lineTo(cssWidth - bounds.right, y);
+        context.stroke();
+        context.fillStyle = '#8294a3';
+        context.fillText(formatCompact(yMaximum * (1 - ratio)), bounds.left - 8, y);
+      }
+
+      values.forEach(function (value, index) {
+        if (!isNumber(value)) return;
+        const x = xAt(index);
+        const barHeight = plotHeight * (value / yMaximum);
+        const y = bounds.top + plotHeight - barHeight;
+        context.fillStyle = (surgeFlags && surgeFlags[index]) ? FLOW_SURGE_COLOR : FLOW_BAR_COLOR;
+        context.fillRect(x - barWidth / 2, y, barWidth, barHeight);
+      });
+
+      const labelIndexes = weeks.length === 1 ? [0] : [0, Math.floor((weeks.length - 1) / 2), weeks.length - 1];
+      context.fillStyle = '#8294a3';
+      context.font = '10px -apple-system, sans-serif';
+      context.textBaseline = 'top';
+      labelIndexes.forEach(function (index, position) {
+        context.textAlign = position === 0 ? 'left' : (position === labelIndexes.length - 1 ? 'right' : 'center');
+        context.fillText(shortDate(weeks[index]), xAt(index), cssHeight - bounds.bottom + 6);
+      });
+    }
+
+    const TAISHAKU_YUSHI_COLOR = '#E6B85C'; // 融資残(own_qtyの黄と紛れないよう別文脈だが同系トーン)
+    const TAISHAKU_KASHIKABU_COLOR = '#6C93A6'; // 貸株残。フロー棒と同系の落ち着いた色
+
+    // 日証金カードの小チャート(増分14b)。datesは残高チャートのweeksとは無関係の独立した日次軸。
+    // 自前のx座標計算を持つ(週チャートのxAtとは再利用しない=データの性質が違うため)
+    function drawTaishakuChart(canvas, dates, yushiValues, kashikabuValues) {
+      if (!canvas || !canvas.getContext) return;
+      const context = canvas.getContext('2d');
+      if (!context) return;
+
+      const cssWidth = Math.max(280, Math.floor(canvas.getBoundingClientRect().width || canvas.parentElement.clientWidth || 600));
+      const cssHeight = canvas.clientHeight || 100;
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 3);
+      canvas.width = Math.floor(cssWidth * pixelRatio);
+      canvas.height = Math.floor(cssHeight * pixelRatio);
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      context.clearRect(0, 0, cssWidth, cssHeight);
+
+      const bounds = { left: 58, right: 14, top: 10, bottom: 18 };
+      const plotWidth = Math.max(1, cssWidth - bounds.left - bounds.right);
+      const plotHeight = Math.max(1, cssHeight - bounds.top - bounds.bottom);
+      const values = [];
+      (yushiValues || []).forEach(function (v) { if (isNumber(v)) values.push(v); });
+      (kashikabuValues || []).forEach(function (v) { if (isNumber(v)) values.push(v); });
+
+      if (!dates.length || !values.length) {
+        context.fillStyle = '#9aabb9';
+        context.font = '12px -apple-system, sans-serif';
+        context.textAlign = 'center';
+        context.fillText('表示できるデータがありません', cssWidth / 2, cssHeight / 2);
+        return;
+      }
+
+      const maximum = Math.max.apply(null, values);
+      const yMaximum = maximum > 0 ? maximum * 1.08 : 1;
+      const xAt = function (index) {
+        return dates.length === 1 ? bounds.left + plotWidth / 2 : bounds.left + plotWidth * index / (dates.length - 1);
+      };
+      const yAt = function (value) { return bounds.top + plotHeight * (1 - value / yMaximum); };
+
+      context.strokeStyle = '#263545';
+      context.lineWidth = 1;
+      context.font = '10px -apple-system, sans-serif';
+      context.textAlign = 'right';
+      context.textBaseline = 'middle';
+      for (let line = 0; line <= 2; line += 1) {
+        const ratio = line / 2;
+        const y = bounds.top + plotHeight * ratio;
+        context.beginPath();
+        context.moveTo(bounds.left, y);
+        context.lineTo(cssWidth - bounds.right, y);
+        context.stroke();
+        context.fillStyle = '#8294a3';
+        context.fillText(formatCompact(yMaximum * (1 - ratio)), bounds.left - 8, y);
+      }
+
+      [
+        { values: yushiValues, color: TAISHAKU_YUSHI_COLOR },
+        { values: kashikabuValues, color: TAISHAKU_KASHIKABU_COLOR }
+      ].forEach(function (series) {
+        const items = Array.isArray(series.values) ? series.values : [];
+        let drawing = false;
+        context.beginPath();
+        items.forEach(function (value, index) {
+          if (!isNumber(value)) { drawing = false; return; }
+          const x = xAt(index);
+          const y = yAt(value);
+          if (drawing) context.lineTo(x, y);
+          else context.moveTo(x, y);
+          drawing = true;
+        });
+        context.strokeStyle = series.color;
+        context.lineWidth = 2;
+        context.lineJoin = 'round';
+        context.lineCap = 'round';
+        context.stroke();
+      });
+
+      const labelIndexes = dates.length === 1 ? [0] : [0, Math.floor((dates.length - 1) / 2), dates.length - 1];
+      context.fillStyle = '#8294a3';
+      context.font = '10px -apple-system, sans-serif';
+      context.textBaseline = 'top';
+      labelIndexes.forEach(function (index, position) {
+        context.textAlign = position === 0 ? 'left' : (position === labelIndexes.length - 1 ? 'right' : 'center');
+        context.fillText(shortDate(dates[index]), xAt(index), cssHeight - bounds.bottom + 5);
+      });
+    }
+
+    // SIGNAL(需給シグナルカード。design.md §6の確定仕様。完全決定論・追加fetchなし)
+    function borrowBalanceSeries(weeks, issue) {
+      if (!issue) return weeks.map(function () { return null; });
+      const own = Array.isArray(issue.own_qty) ? issue.own_qty : [];
+      const ten = Array.isArray(issue.ten_qty) ? issue.ten_qty : [];
+      return weeks.map(function (week, index) {
+        const a = own[index];
+        const b = ten[index];
+        return (isNumber(a) && isNumber(b)) ? (a + b) : null; // nullは欠測として伝播(0扱いしない)
+      });
+    }
+
+    // 指標1: 借株残の4週変化率。有効週(非null週)が8週未満なら status:'insufficient'
+    function computeBorrowIndicator(borrow) {
+      const validCount = borrow.filter(isNumber).length;
+      if (validCount < MIN_VALID_WEEKS) {
+        return { status: 'insufficient', validCount: validCount, direction: 'neutral', changeRatio: null };
+      }
+      const latestIndex = borrow.length - 1;
+      const compareIndex = latestIndex - 4;
+      const latest = borrow[latestIndex];
+      const compare = compareIndex >= 0 ? borrow[compareIndex] : null;
+      if (!isNumber(latest) || !isNumber(compare) || compare === 0) {
+        return { status: 'unavailable', validCount: validCount, direction: 'neutral', changeRatio: null };
+      }
+      const changeRatio = (latest - compare) / compare;
+      const direction = changeRatio >= BORROW_CHANGE_THRESHOLD ? 'increase'
+        : (changeRatio <= -BORROW_CHANGE_THRESHOLD ? 'decrease' : 'neutral');
+      return { status: 'ok', validCount: validCount, direction: direction, changeRatio: changeRatio };
+    }
+
+    // 指標2: 3年内パーセンタイル。バッジ判定には使わず根拠行の水準句(「過去3年でも多い/少ない水準」)への
+    // 反映のみに使う(増分5.1で統計用語の生数値は根拠行から落とし、水準の種別だけ返す)
+    function borrowPercentileLevel(borrow) {
+      const valid = borrow.filter(isNumber);
+      const latest = borrow[borrow.length - 1];
+      if (!valid.length || !isNumber(latest)) return null;
+      const total = valid.length;
+      const topPct = Math.round(valid.filter(function (v) { return v >= latest; }).length / total * 100);
+      const bottomPct = Math.round(valid.filter(function (v) { return v <= latest; }).length / total * 100);
+      if (topPct <= PERCENTILE_BAND) return 'top';
+      if (bottomPct <= PERCENTILE_BAND) return 'bottom';
+      return null;
+    }
+
+    function percentileLevelPhrase(level) {
+      if (level === 'top') return '(過去3年でも多い水準)';
+      if (level === 'bottom') return '(過去3年でも少ない水準)';
+      return '';
+    }
+
+    // FLOW(増分11後半。週次フロー段=s_borrow_qtyの棒グラフ。design.md §6「週次フロー段」)
+    // 値がvalidValues内で何パーセンタイルに位置するか(0〜100)。nearest-rank方式(自分以下の値の割合)。
+    // 例: 10個の値[1..10]のうち9(=90%目の値)はcountLE=9→90.0ちょうど、8はcountLE=8→80.0
+    function percentileRankOf(value, validValues) {
+      if (!validValues.length) return null;
+      const countLE = validValues.filter(function (v) { return v <= value; }).length;
+      return (countLE / validValues.length) * 100;
+    }
+
+    // 各週が「急増週」(収録期間内の非null値の上位10%水準=90パーセンタイル以上)かどうかを返す(bool配列、weeksと同長)
+    function computeFlowSurgeFlags(values) {
+      const list = Array.isArray(values) ? values : [];
+      const validValues = list.filter(isNumber);
+      return list.map(function (value) {
+        if (!isNumber(value) || !validValues.length) return false;
+        const rank = percentileRankOf(value, validValues);
+        return rank !== null && rank >= FLOW_SURGE_PERCENTILE;
+      });
+    }
+
+    function hasRecentFlowSurge(surgeFlags, recentCount) {
+      return surgeFlags.slice(-recentCount).some(function (flag) { return flag; });
+    }
+
+    // 各報告者の「基準日以前の最新ratio」を合計する
+    function sumLatestRatioAsOf(events, asOfDate) {
+      const bySeller = Object.create(null);
+      events.forEach(function (event) {
+        if (event.date > asOfDate) return;
+        const current = bySeller[event.seller];
+        if (!current || event.date > current.date) bySeller[event.seller] = event;
+      });
+      let sum = 0;
+      let any = false;
+      Object.keys(bySeller).forEach(function (seller) {
+        const ratio = bySeller[seller].ratio;
+        if (isNumber(ratio)) { sum += ratio; any = true; }
+      });
+      return any ? sum : null;
+    }
+
+    // MARKERS(増分10。design.md §6「空売りイベントマーカー」の確定仕様)
+    // 基準日asOfDate以前の、報告者ごとの最新ratioをMapで返す(sumLatestRatioAsOfの内訳版)
+    function reporterLatestRatioMap(events, asOfDate) {
+      const bySeller = Object.create(null);
+      events.forEach(function (event) {
+        if (event.date > asOfDate) return;
+        const current = bySeller[event.seller];
+        if (!current || event.date > current.date) bySeller[event.seller] = event;
+      });
+      const map = Object.create(null);
+      Object.keys(bySeller).forEach(function (seller) {
+        const ratio = bySeller[seller].ratio;
+        if (isNumber(ratio)) map[seller] = ratio;
+      });
+      return map;
+    }
+
+    function sumRatioMap(map) {
+      const keys = Object.keys(map);
+      if (!keys.length) return null;
+      let sum = 0;
+      keys.forEach(function (key) { sum += map[key]; });
+      return sum;
+    }
+
+    // 2時点(thisMap/priorMap)を比べ、変化幅の絶対値が最大の報告者を返す(「主因」)。
+    // 未報告は0扱い(sumRatioMapの合算と同じ扱いに合わせる)
+    function topMoverBetween(thisMap, priorMap) {
+      const sellers = Object.create(null);
+      Object.keys(thisMap).forEach(function (seller) { sellers[seller] = true; });
+      Object.keys(priorMap).forEach(function (seller) { sellers[seller] = true; });
+      let top = null;
+      Object.keys(sellers).forEach(function (seller) {
+        const thisRatio = isNumber(thisMap[seller]) ? thisMap[seller] : 0;
+        const priorRatio = isNumber(priorMap[seller]) ? priorMap[seller] : 0;
+        const deltaPt = (thisRatio - priorRatio) * 100;
+        const absDeltaPt = Math.abs(deltaPt);
+        if (!top || absDeltaPt > top.absDeltaPt) top = { seller: seller, deltaPt: deltaPt, absDeltaPt: absDeltaPt };
+      });
+      return top;
+    }
+
+    // 各週(月〜日、既存mondayKeyOfの流儀)の「週末(日曜)時点の報告者別最新ratio合計」を
+    // 前週末時点と比較する。+0.1pt以上=up(▲橙) / -0.1pt以下=down(▽青) / それ以外・比較不能はnull。
+    // 報告が一度もない銘柄は全週nullになる(帯・明細リストの非表示は呼び出し側でmarkers.some(Boolean)判定)。
+    // 前週末時点に報告が一切ない場合(sumPriorがnull)も比較不能としてnull(0との比較はしない。
+    // computeShortIndicatorの「no-history」と同じ考え方)
+    function computeShortWeekMarkers(events, weeks) {
+      const validEvents = (events || []).filter(function (event) {
+        return event && typeof event.date === 'string' && typeof event.seller === 'string' && isNumber(event.ratio);
+      });
+      return weeks.map(function (week) {
+        const monday = mondayKeyOf(week);
+        if (!monday) return null;
+        const weekEnd = addDaysToYmd(monday, 6); // 週末(日曜)
+        const priorWeekEnd = weekEnd ? addDaysToYmd(weekEnd, -7) : null;
+        if (!weekEnd || !priorWeekEnd) return null;
+        const thisMap = reporterLatestRatioMap(validEvents, weekEnd);
+        const priorMap = reporterLatestRatioMap(validEvents, priorWeekEnd);
+        const sumThis = sumRatioMap(thisMap);
+        const sumPrior = sumRatioMap(priorMap);
+        if (!isNumber(sumThis) || !isNumber(sumPrior)) return null;
+        const deltaPt = (sumThis - sumPrior) * 100;
+        const direction = deltaPt >= SHORT_MARKER_THRESHOLD_PT ? 'up'
+          : (deltaPt <= -SHORT_MARKER_THRESHOLD_PT ? 'down' : null);
+        if (!direction) return null;
+        return {
+          direction: direction,
+          deltaPt: deltaPt,
+          sumThis: sumThis,
+          sumPrior: sumPrior,
+          week: week,
+          topMover: topMoverBetween(thisMap, priorMap)
+        };
+      });
+    }
+
+    function formatSignedPt(pt) {
+      if (!isNumber(pt)) return '—';
+      const rounded = Math.round(pt * 100) / 100;
+      return (rounded >= 0 ? '+' : '') + rounded.toFixed(2) + 'pt';
+    }
+
+    function shortMarkerLineText(marker) {
+      const arrow = marker.direction === 'up' ? '▲' : '▽';
+      let line = shortDate(marker.week) + ' ' + arrow + ' ' + formatShortSumPercent(marker.sumPrior) + '→' + formatShortSumPercent(marker.sumThis);
+      if (marker.topMover) {
+        line += '(主因: ' + marker.topMover.seller + ' ' + formatSignedPt(marker.topMover.deltaPt) + ')';
+      }
+      return line;
+    }
+
+    // 指標3: 大口空売り合計ratioの4週前比。報告が一度もなければ中立扱い。
+    // 報告はあるが4週(28日)前時点にはまだ報告が無かった(直近に報告が始まったばかり)場合は
+    // 'no-history'として区別する。events自体は存在するので根拠行で「報告なし」と誤表示しない。
+    // fetchFailed=trueの場合(shortShardのfetch自体が失敗)は'error'として区別する。
+    // 「不明(取得失敗)」と「ゼロ(報告なし)」は別状態であり、根拠行を混同して確定情報のように
+    // 表示しない(バッジ判定上はいずれもneutral扱いで変わらない)。
+    function computeShortIndicator(events, fetchFailed) {
+      if (fetchFailed) return { status: 'error', direction: 'neutral' };
+      const validEvents = (events || []).filter(function (event) {
+        return event && typeof event.date === 'string' && typeof event.seller === 'string';
+      });
+      if (!validEvents.length) return { status: 'none', direction: 'neutral' };
+      const latestDate = validEvents.reduce(function (max, event) { return event.date > max ? event.date : max; }, validEvents[0].date);
+      const priorDate = addDaysToYmd(latestDate, -28);
+      const sumLatest = sumLatestRatioAsOf(validEvents, latestDate);
+      if (!isNumber(sumLatest)) return { status: 'none', direction: 'neutral' };
+      const sumPrior = priorDate ? sumLatestRatioAsOf(validEvents, priorDate) : null;
+      if (!isNumber(sumPrior)) return { status: 'no-history', direction: 'neutral', latestDate: latestDate, sumLatest: sumLatest };
+      const deltaPt = (sumLatest - sumPrior) * 100;
+      const direction = deltaPt >= SHORT_RATIO_THRESHOLD_PT ? 'increase'
+        : (deltaPt <= -SHORT_RATIO_THRESHOLD_PT ? 'decrease' : 'neutral');
+      return { status: 'ok', direction: direction, sumLatest: sumLatest, sumPrior: sumPrior, deltaPt: deltaPt };
+    }
+
+    // バッジ4値(design.md §6): 積み上がり=橙 / 買い戻し進行=青 / 中立=灰 / データ不足=灰
+    function computeSignalBadge(borrowIndicator, shortIndicator) {
+      if (borrowIndicator.status === 'insufficient') {
+        return { key: 'insufficient', label: 'データ不足', className: 'badge-gray' };
+      }
+      const d1 = borrowIndicator.direction;
+      const d3 = shortIndicator.direction;
+      if (d1 === 'increase' && d3 === 'increase') {
+        return { key: 'pressure-up', label: '売り圧力 積み上がり', className: 'badge-orange' };
+      }
+      if ((d1 === 'decrease' && d3 === 'decrease') || (d1 === 'decrease' && d3 === 'neutral') || (d1 === 'neutral' && d3 === 'decrease')) {
+        return { key: 'covering', label: '買い戻し進行', className: 'badge-blue' };
+      }
+      return { key: 'neutral', label: '中立', className: 'badge-gray' };
+    }
+
+    function formatSignedPercent(ratio) {
+      if (!isNumber(ratio)) return '—';
+      const pct = Math.round(ratio * 1000) / 10;
+      return (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%';
+    }
+
+    function shortDirectionWord(direction) {
+      return direction === 'increase' ? '増加' : (direction === 'decrease' ? '減少' : '横ばい');
+    }
+
+    // 根拠行(増分5.1書式): 「借株残: 4週間で{±X%}{水準句} / 大口空売り: {空売り句}」
+    function buildSignalEvidence(borrowIndicator, shortIndicator, percentileLevel) {
+      let borrowPart;
+      if (borrowIndicator.status === 'ok') {
+        borrowPart = '借株残: 4週間で' + formatSignedPercent(borrowIndicator.changeRatio) + percentileLevelPhrase(percentileLevel);
+      } else {
+        borrowPart = '借株残: データ不足';
+      }
+      let shortPart;
+      if (shortIndicator.status === 'ok') {
+        shortPart = formatShortSumPercent(shortIndicator.sumPrior) + '→' + formatShortSumPercent(shortIndicator.sumLatest) + '(' + shortDirectionWord(shortIndicator.direction) + ')';
+      } else if (shortIndicator.status === 'no-history') {
+        shortPart = '現在' + formatShortSumPercent(shortIndicator.sumLatest) + '(4週前のデータなし)';
+      } else if (shortIndicator.status === 'error') {
+        shortPart = 'データを取得できません';
+      } else {
+        shortPart = '報告なし(0.5%以上の大口空売りをしている機関はいません)';
+      }
+      return borrowPart + ' / 大口空売り: ' + shortPart;
+    }
+
+    // バッジ直下の状況説明文(増分5.1、監督者確定コピー。一字一句このまま使う)
+    function buildStatusText(badge, borrowIndicator, shortIndicator) {
+      if (badge.key === 'insufficient') {
+        return '収録データが8週分に満たないため判定できません(新規上場銘柄など)。';
+      }
+      if (badge.key === 'neutral') {
+        return '借株残・大口空売りに大きな変化はありません。需給に目立った偏りが出ていない状態です。';
+      }
+      const borrowPct = formatSignedPercent(borrowIndicator.changeRatio);
+      if (badge.key === 'pressure-up') {
+        let text = '空売りの元手になる「借株」が4週間で' + borrowPct + '増えています。機関投資家が売りの構えを強めている状態です。';
+        if (shortIndicator.direction === 'increase') text += '大口空売りの残高も増えています。';
+        return text;
+      }
+      // covering。借株残の変化率が欠測(status!=='ok')でも空売り減少だけでこのバッジになりうるため、
+      // その場合は数値を含まない文言に落とす(「—」の混入防止。2026-07-23 reviewer指摘)
+      if (borrowIndicator.status !== 'ok') {
+        return '大口空売りの残高が減っており、空売りの手仕舞い(買い戻し)が進んでいます。売り圧力は弱まる方向です。';
+      }
+      return '空売りしていた投資家が、株を買い戻して返す動きを進めています(借株残が4週間で' + borrowPct + ')。売り圧力は弱まる方向です。';
+    }
+
+    // 株価週足の4週変化率: 最新の非null closeと、そこから4本前(非null値で数えて4つ前)の非null closeを比較。
+    // 非null本数が5未満(latest+4本前が確保できない)ならnull
+    function priceWeeklyChange(prices) {
+      const weekly = prices && prices.weekly;
+      const closes = weekly && Array.isArray(weekly.close) ? weekly.close : [];
+      const validValues = closes.filter(isNumber);
+      if (validValues.length < PRICE_TREND_MIN_POINTS) return null;
+      const latest = validValues[validValues.length - 1];
+      const fourBack = validValues[validValues.length - 1 - 4];
+      if (!isNumber(latest) || !isNumber(fourBack) || fourBack === 0) return null;
+      const changeRatio = (latest - fourBack) / fourBack;
+      const direction = changeRatio >= PRICE_CHANGE_THRESHOLD ? 'up'
+        : (changeRatio <= -PRICE_CHANGE_THRESHOLD ? 'down' : 'flat');
+      return { changeRatio: changeRatio, direction: direction };
+    }
+
+    // 株価との照らし合わせ本文(増分5.1、監督者確定コピー。9通りを一字一句このまま使う)
+    function buildPriceComparisonText(priceChange, borrowDirection) {
+      const pct = formatSignedPercent(priceChange.changeRatio);
+      const dir = priceChange.direction;
+      if (dir === 'up' && borrowDirection === 'increase') return '株価が上がる中で空売りも積み増されています。売り方と買い方の綱引きで、さらに上昇が続くと売り方の買い戻し(踏み上げ)が上昇を加速することがあります。';
+      if (dir === 'up' && borrowDirection === 'decrease') return '株価の上昇と同時に空売りの手仕舞いが進んでいます。需給面では上昇を後押しする組み合わせです。';
+      if (dir === 'up') return '株価は4週間で' + pct + '上昇していますが、空売り側に目立った動きはありません。';
+      if (dir === 'down' && borrowDirection === 'increase') return '株価の下落と空売りの積み増しが同時に起きています。売り圧力が強い組み合わせです。';
+      if (dir === 'down' && borrowDirection === 'decrease') return '株価は下落していますが、空売り側も手仕舞いを進めています。売り圧力は峠を越えつつある可能性があります。';
+      if (dir === 'down') return '株価は4週間で' + pct + '下落していますが、空売り側に目立った動きはありません。';
+      if (dir === 'flat' && borrowDirection === 'increase') return '株価は横ばいですが、水面下で空売りが積み上がっています。';
+      if (dir === 'flat' && borrowDirection === 'decrease') return '株価は横ばいのまま、空売りの手仕舞いが進んでいます。';
+      return '株価・需給とも目立った動きはありません。';
+    }
+
+    // 指標1がok(unavailable/insufficientではない)かつ株価収録・週足5本以上のときだけ行を生成。
+    // それ以外はnull(呼び出し側で行自体を出さない)
+    function buildPriceComparisonLine(prices, borrowIndicator) {
+      if (borrowIndicator.status !== 'ok' || !prices) return null;
+      const change = priceWeeklyChange(prices);
+      if (!change) return null;
+      return '株価との照らし合わせ: ' + buildPriceComparisonText(change, borrowIndicator.direction);
+    }
+
+    // 純関数: {weeks, issue}(series shard)・events(shortイベント配列)・prices(価格ペイロード)から
+    // 表示用データを組み立てる。computeSignal(weeks, issue, events, shortFetchFailed, prices) という
+    // 名前でnode -e から直接呼べる形にしてある。
+    function computeSignal(weeks, issue, events, shortFetchFailed, prices) {
+      const borrow = borrowBalanceSeries(weeks, issue);
+      const borrowIndicator = computeBorrowIndicator(borrow);
+      const shortIndicator = computeShortIndicator(events, shortFetchFailed);
+      const badge = computeSignalBadge(borrowIndicator, shortIndicator);
+      const percentileLevel = badge.key === 'insufficient' ? null : borrowPercentileLevel(borrow);
+      const statusText = buildStatusText(badge, borrowIndicator, shortIndicator);
+      const evidence = badge.key === 'insufficient' ? null : buildSignalEvidence(borrowIndicator, shortIndicator, percentileLevel);
+      const priceComparison = badge.key === 'insufficient' ? null : buildPriceComparisonLine(prices, borrowIndicator);
+      return {
+        badge: badge,
+        statusText: statusText,
+        evidence: evidence,
+        priceComparison: priceComparison,
+        borrowIndicator: borrowIndicator,
+        shortIndicator: shortIndicator
+      };
+    }
+
+    // RENDER
+    function freshnessMarkup() {
+      if (state.metaError) return '<div class="freshness warning" role="status">鮮度情報を取得できません</div>';
+      if (!state.meta) return '';
+      const days = daysSinceYmd(state.meta.latest_week);
+      if (days === null) return '<div class="freshness warning" role="status">最新週の日付形式を確認できません</div>';
+      const stale = days > 14;
+      const detail = days >= 0 ? '（' + days + '日前）' : '';
+      return '<div class="freshness' + (stale ? ' warning' : '') + '" role="status">' +
+        (stale ? '更新が遅れています：' : '最新データ：') +
+        '<time datetime="' + escapeHtml(state.meta.latest_week) + '">' + escapeHtml(state.meta.latest_week) + '</time>' + detail + '</div>';
+    }
+
+    function renderSearchPage() {
+      state.currentChart = null;
+      state.currentTaishakuChart = null;
+      const app = document.getElementById('app');
+      const watchCount = loadWatchlist().codes.length;
+      app.innerHTML = freshnessMarkup() +
+        '<a class="watch-count-link" href="#/watch">☆ ウォッチリスト（' + watchCount + '件）</a>' +
+        '<section class="search-view" aria-labelledby="search-title">' +
+          '<div class="hero">' +
+            '<p class="eyebrow">SUPPLY &amp; DEMAND</p>' +
+            '<h1 id="search-title">銘柄の需給を探す</h1>' +
+            '<p class="lead">銘柄コードまたは銘柄名から、JSDAの週次貸借残高を検索できます。用語が分からないときは<a class="guide-link-inline" href="#/guide">用語・見方ガイド</a>をご覧ください。</p>' +
+          '</div>' +
+          '<div class="search-box">' +
+            '<input id="issue-search" type="search" inputmode="search" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="例：285A / キオクシア" value="' + escapeHtml(state.query) + '" aria-label="銘柄コードまたは銘柄名">' +
+          '</div>' +
+          '<p id="result-summary" class="result-summary"></p>' +
+          '<ul id="result-list" class="result-list"></ul>' +
+        '</section>';
+      patchSearchResults();
+    }
+
+    function patchSearchResults() {
+      const list = document.getElementById('result-list');
+      const summary = document.getElementById('result-summary');
+      if (!list || !summary) return;
+
+      if (state.issuesError) {
+        summary.textContent = '銘柄データを取得できませんでした。再読み込みしてください。';
+        list.replaceChildren();
+        return;
+      }
+
+      const normalized = normalizeSearch(state.query);
+      if (!normalized) {
+        summary.textContent = state.issues.length ? '銘柄コードまたは銘柄名を入力してください（' + NUMBER_FORMAT.format(state.issues.length) + '銘柄）' : '銘柄データを読み込んでいます…';
+        list.replaceChildren();
+        return;
+      }
+
+      const matches = [];
+      for (let index = 0; index < state.issues.length; index += 1) {
+        const issue = state.issues[index];
+        if (issue.searchText.indexOf(normalized) !== -1) matches.push(issue);
+        if (matches.length >= RESULT_LIMIT) break;
+      }
+
+      summary.textContent = matches.length ? matches.length + (matches.length === RESULT_LIMIT ? '件以上' : '件') + '見つかりました' : '該当する銘柄がありません';
+      list.innerHTML = matches.map(function (issue) {
+        return '<li><a class="result-link" href="#/issue/' + encodeURIComponent(issue.code) + '">' +
+          '<span class="result-name">' + escapeHtml(issue.name) + '</span>' +
+          '<span class="issue-code">' + escapeHtml(issue.code) + '</span>' +
+        '</a></li>';
+      }).join('');
+    }
+
+    function deltaCell(current, previous) {
+      if (!isNumber(current) || !isNumber(previous)) return '<td class="missing">—</td>';
+      const delta = current - previous;
+      const className = delta > 0 ? 'delta-up' : (delta < 0 ? 'delta-down' : 'delta-flat');
+      const prefix = delta > 0 ? '+' : '';
+      return '<td class="' + className + '">' + prefix + formatNumber(delta) + '</td>';
+    }
+
+    function renderIssueData(code, weeks, issue, prices, shortEvents) {
+      const target = document.getElementById('issue-content');
+      if (!target) return;
+      const latestIndex = weeks.length - 1;
+      const previousIndex = latestIndex - 1;
+      const latestWeek = latestIndex >= 0 ? weeks[latestIndex] : '—';
+      const previousWeek = previousIndex >= 0 ? weeks[previousIndex] : '—';
+      const rows = TABLE_ROWS.map(function (row) {
+        const values = Array.isArray(issue[row.key]) ? issue[row.key] : [];
+        const current = latestIndex >= 0 ? values[latestIndex] : null;
+        const previous = previousIndex >= 0 ? values[previousIndex] : null;
+        return '<tr>' +
+          '<td>' + escapeHtml(row.label) + '<span class="unit">' + escapeHtml(row.unit) + '</span></td>' +
+          '<td>' + formatNumber(current) + '</td>' +
+          '<td>' + formatNumber(previous) + '</td>' +
+          deltaCell(current, previous) +
+        '</tr>';
+      }).join('');
+
+      const priceValues = prices ? alignPricesToWeeks(weeks, buildPriceWeekMap(prices)) : null;
+      const hasPriceValues = !!(priceValues && priceValues.some(isNumber));
+      const legendItems = SERIES.map(function (series) {
+        return '<li><span class="legend-swatch" style="--swatch:' + series.color + '"></span>' + escapeHtml(series.label) + '</li>';
+      });
+      if (hasPriceValues) {
+        legendItems.push('<li><span class="legend-swatch" style="--swatch:' + PRICE_SERIES.color + '"></span>' + escapeHtml(PRICE_SERIES.label) + '</li>');
+      }
+
+      let priceSummaryHtml = '';
+      if (prices) {
+        const latest = latestDailyPrice(prices);
+        priceSummaryHtml = '<p class="price-summary">' +
+          (latest && latest.date ? '株価 最新終値 ' + formatNumber(latest.close) + '円（' + escapeHtml(latest.date) + '）' : '株価データを読み込みました') +
+          '</p>';
+      } else {
+        priceSummaryHtml = '<p class="price-summary">株価未収録（config/price_list.jsonに追加すると収録されます）</p>';
+      }
+
+      // 空売りイベントマーカー(増分10)。報告が一度もない銘柄はmarkersが全null→帯・明細とも非表示
+      const shortMarkers = computeShortWeekMarkers(shortEvents || [], weeks);
+      const hasShortMarkers = shortMarkers.some(function (marker) { return marker; });
+      let markerListHtml = '';
+      if (hasShortMarkers) {
+        const recentMarkers = [];
+        shortMarkers.forEach(function (marker) { if (marker) recentMarkers.push(marker); });
+        const recentItems = recentMarkers.slice(-SHORT_MARKER_LIST_LIMIT).reverse(); // 直近優先(新しい順)
+        markerListHtml = '<ul class="short-marker-list" aria-label="大口空売り合計割合の週次変化">' +
+          recentItems.map(function (marker) { return '<li>' + escapeHtml(shortMarkerLineText(marker)) + '</li>'; }).join('') +
+          '</ul>';
+      }
+
+      // 週次フロー段(増分11後半)。s_borrow_qtyが全週nullの銘柄は段ごと非表示(「データなし」表示も出さない)
+      const sBorrowValues = Array.isArray(issue.s_borrow_qty) ? issue.s_borrow_qty : [];
+      const sLendValues = Array.isArray(issue.s_lend_qty) ? issue.s_lend_qty : [];
+      const hasFlowData = sBorrowValues.some(isNumber);
+      const flowSurgeFlags = hasFlowData ? computeFlowSurgeFlags(sBorrowValues) : [];
+      const hasRecentFlowSurgeFlag = hasFlowData && hasRecentFlowSurge(flowSurgeFlags, FLOW_SURGE_RECENT_WEEKS);
+      let flowSectionHtml = '';
+      if (hasFlowData) {
+        const latestBorrowFlow = latestIndex >= 0 ? sBorrowValues[latestIndex] : null;
+        const latestLendFlow = latestIndex >= 0 ? sLendValues[latestIndex] : null;
+        flowSectionHtml =
+          '<div class="flow-section">' +
+            '<div class="flow-header">' +
+              '<h3>週次フロー(新規成約)</h3>' +
+              (hasRecentFlowSurgeFlag ? '<span class="flow-surge-tag">フロー急増</span>' : '') +
+            '</div>' +
+            '<p class="section-subtitle">最新週 借入新規 ' + formatNumber(latestBorrowFlow) + '株・貸付新規 ' + formatNumber(latestLendFlow) + '株</p>' +
+            '<p class="flow-explainer">その週に新しく成立した貸し借りの量です。上の残高が『いま積み上がっている総量』なのに対し、こちらは『その週の動き』を示します。</p>' +
+            '<div class="flow-chart-wrap"><canvas id="flow-chart" role="img" aria-label="' + escapeHtml(code) + 'の週次新規成約高（フロー）棒グラフ' + (hasRecentFlowSurgeFlag ? '（急増週あり）' : '') + '">週次フロー棒グラフ</canvas></div>' +
+          '</div>';
+      }
+
+      target.innerHTML =
+        '<section class="card" aria-labelledby="chart-title">' +
+          '<h2 id="chart-title">貸借残高の推移</h2>' +
+          '<p class="section-subtitle">週次・単位：株（欠測期間は線を接続しません）</p>' +
+          priceSummaryHtml +
+          '<ul class="legend" aria-label="系列凡例">' + legendItems.join('') + '</ul>' +
+          markerListHtml +
+          '<div class="chart-wrap"><canvas id="series-chart" role="img" aria-label="' + escapeHtml(code) + 'の貸借残高時系列チャート' + (hasPriceValues ? '（株価重ね描き付き）' : '') + (hasShortMarkers ? '（大口空売りイベントマーカー付き）' : '') + '">時系列チャート</canvas></div>' +
+          flowSectionHtml +
+        '</section>' +
+        '<section class="card" aria-labelledby="delta-title">' +
+          '<h2 id="delta-title">最新週と前週の比較</h2>' +
+          '<div class="table-wrap"><table>' +
+            '<thead><tr><th scope="col">項目</th><th scope="col">最新<br>' + escapeHtml(latestWeek) + '</th><th scope="col">前週<br>' + escapeHtml(previousWeek) + '</th><th scope="col">前週差</th></tr></thead>' +
+            '<tbody>' + rows + '</tbody>' +
+          '</table></div>' +
+        '</section>' +
+        '<p class="note">証券会社間で株を貸し借りした残高の推移です。「借入」の増減が空売りの勢いの目安になります。</p>' +
+        '<details class="detail-note"><summary>データの厳密な注意点</summary>' +
+          '<p>JSDAは制度貸借を除く一般貸借。貸付残高は転貸ダブルカウントの可能性があり、借株需要の代理変数として見る</p>' +
+        '</details>';
+
+      state.currentChart = {
+        weeks: weeks,
+        issue: issue,
+        priceValues: priceValues,
+        shortMarkers: shortMarkers,
+        hasPriceValues: hasPriceValues,
+        flow: hasFlowData ? { values: sBorrowValues, surgeFlags: flowSurgeFlags } : null
+      };
+      // innerHTML代入直後でもgetBoundingClientRectが同期レイアウトを強制するため
+      // 直接描画できる。rAF待ちにすると非表示タブ(iOS PWAのバックグラウンド復帰等)で
+      // コールバックが発火せずチャートが空のままになる(2026-07-22実測)
+      drawChart(document.getElementById('series-chart'), weeks, issue, priceValues, shortMarkers);
+      if (hasFlowData) {
+        drawFlowChart(document.getElementById('flow-chart'), weeks, sBorrowValues, flowSurgeFlags, hasPriceValues);
+      }
+    }
+
+    function renderSignalCard(target, weeks, issue, events, shortFetchFailed, prices) {
+      if (!target) return;
+      const signal = computeSignal(weeks, issue, events, shortFetchFailed, prices);
+      const evidenceHtml = signal.evidence ? '<p class="signal-evidence">' + escapeHtml(signal.evidence) + '</p>' : '';
+      const priceCompareHtml = signal.priceComparison ? '<p class="signal-price-compare">' + escapeHtml(signal.priceComparison) + '</p>' : '';
+      target.innerHTML =
+        '<section class="card signal-card" aria-labelledby="signal-title">' +
+          '<h2 id="signal-title" class="visually-hidden">需給シグナル</h2>' +
+          '<span class="signal-badge ' + signal.badge.className + '">' + escapeHtml(signal.badge.label) + '</span>' +
+          '<p class="signal-status-text">' + escapeHtml(signal.statusText) + '</p>' +
+          evidenceHtml +
+          priceCompareHtml +
+          confidenceTagsHtml(!!prices, signal.shortIndicator.status) +
+          '<p class="signal-note">機械的な閾値による参考情報であり売買判断ではありません。</p>' +
+          '<details class="detail-note"><summary>このシグナルの見方(かんたん解説)</summary>' +
+            '<p>・「借株」とは: 機関投資家が空売り(株を借りて売り、値下がり後に買い戻して返す取引)のために借りている株のことです。借株が増える=空売りの準備が進んでいる、減る=買い戻しが進んでいる、と読めます。</p>' +
+            '<p>・「大口空売り」とは: 発行済株式の0.5%以上を空売りすると、機関名の公表が義務付けられています。誰がどれだけ売っているかが見えます。</p>' +
+            '<p>・報告が「0.5%未満に低下」となった場合、その機関の空売りが基準未満まで減った(買い戻しが進んだ)ことを意味します。</p>' +
+            '<p>・注意: 貸し借りの集計には又貸し分の二重計上がありえるため、残高の絶対値より「増えているか減っているか」を見るのがコツです。</p>' +
+            '<p>・この判定は決まった計算式(閾値: 借株残4週±10%、空売り残高4週±0.5ポイント)による機械的な参考情報です。</p>' +
+            '<p>・チャート下の▲▽は、大口空売りの合計割合がその週に増えた(▲)/減った(▽)ことを示します。</p>' +
+            '<p>・週次フローの棒が急に高くなった週は、貸し借りの動きが活発だった週です。残高の増減と合わせて見ると、その週に売り方の仕込み(借株の急増)があったかを推測できます。</p>' +
+            '<p>・下の方の「日証金(制度信用)」カードは個人投資家サイドの目安です。機関(このカード)と個人(日証金カード)で売り買いの傾きが逆になることもあります。</p>' +
+            '<p>もっと詳しく知りたいときは<a class="guide-link-inline" href="#/guide">用語・見方ガイド</a>もご覧ください。</p>' +
+          '</details>' +
+        '</section>';
+    }
+
+    async function renderIssuePage(code) {
+      state.currentChart = null;
+      state.currentTaishakuChart = null;
+      const app = document.getElementById('app');
+      const info = state.issueByCode[code];
+      if (!info) {
+        app.innerHTML = freshnessMarkup() + '<a class="back-link" href="#/">← 銘柄検索へ</a><div class="card status-card error">銘柄「' + escapeHtml(code) + '」が見つかりません。</div>';
+        return;
+      }
+
+      app.innerHTML = freshnessMarkup() +
+        '<a class="back-link" href="#/">← 銘柄検索へ</a>' +
+        '<div class="issue-heading"><h1>' + escapeHtml(info.name) + '</h1>' +
+          '<div class="issue-heading-meta"><span class="issue-code">' + escapeHtml(code) + '</span>' +
+          '<span id="watch-toggle-wrap">' + watchButtonHtml(code) + '</span></div>' +
+        '</div>' +
+        '<div id="signal-content"><div class="card status-card">需給シグナルを計算しています…</div></div>' +
+        '<div id="issue-content"><div class="card status-card">時系列データを読み込んでいます…</div></div>' +
+        '<div id="short-content"><div class="card status-card">空売り報告を読み込んでいます…</div></div>' +
+        '<div id="taishaku-content"><div class="card status-card">日証金データを確認しています…</div></div>';
+
+      const requestId = ++state.routeRequest;
+      const seriesPromise = loadSeries(info.shard);
+      const shortShardPromise = loadShortShard(code.slice(0, 2));
+      // 株価は(a)重ね描き専用の追加fetch。JSDA・shortの成否とは独立(404=株価未収録として扱う)
+      const pricesPromise = loadPrices(code);
+      // 日証金(増分14b)も他セクションと独立した追加fetch。404・失敗はカード非表示に倒す
+      const taishakuPromise = loadTaishakuSeries(code.slice(0, 2));
+
+      renderShortSection(code, requestId, shortShardPromise);
+      renderSignalSection(code, requestId, seriesPromise, shortShardPromise, pricesPromise);
+      renderTaishakuSection(code, requestId, taishakuPromise);
+
+      try {
+        const payload = await seriesPromise;
+        if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
+        const issue = payload.issues[code];
+        if (!issue) throw new Error('この銘柄の時系列データがありません。');
+        let prices = null;
+        try { prices = await pricesPromise; } catch (priceError) { prices = null; }
+        // 空売りイベントマーカー(増分10)用。既にfetch済みのshortShardPromiseを再利用するので
+        // 追加fetchは発生しない。取得失敗時はマーカーなし(帯非表示)にフォールバック
+        let shortEvents = [];
+        try {
+          const shard = await shortShardPromise;
+          const shortIssue = shard && shard.issues ? shard.issues[code] : null;
+          shortEvents = (shortIssue && Array.isArray(shortIssue.events)) ? shortIssue.events : [];
+        } catch (shortError) {
+          shortEvents = [];
+        }
+        if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
+        renderIssueData(code, payload.weeks, issue, prices, shortEvents);
+      } catch (error) {
+        if (requestId !== state.routeRequest) return;
+        const target = document.getElementById('issue-content');
+        if (target) target.innerHTML = '<div class="card status-card error">' + escapeHtml(error.message || '時系列データを表示できません。') + '</div>';
+      }
+    }
+
+    async function renderSignalSection(code, requestId, seriesPromise, shortShardPromise, pricesPromise) {
+      const target = document.getElementById('signal-content');
+      if (!target) return;
+      let weeks = [];
+      let issue = null;
+      let events = [];
+      let shortFetchFailed = false;
+      let prices = null;
+      try {
+        const payload = await seriesPromise;
+        weeks = payload.weeks;
+        issue = payload.issues[code] || null;
+      } catch (error) {
+        issue = null;
+      }
+      try {
+        const shard = await shortShardPromise;
+        const shortIssue = shard && shard.issues ? shard.issues[code] : null;
+        events = (shortIssue && Array.isArray(shortIssue.events)) ? shortIssue.events : [];
+      } catch (error) {
+        // shard自体のfetch失敗は「報告が一度もない(events=[])」とは別状態。
+        // 握りつぶさずshortFetchFailedで区別し、根拠行が「空売り報告なし」と
+        // 確定情報のように誤表示しないようにする(空売りカード側の
+        // 「空売りデータを取得できません。」表示と整合させる)。
+        events = [];
+        shortFetchFailed = true;
+      }
+      // 株価との照らし合わせ(増分5.1)は price収録銘柄のみの補足行。fetch失敗・未収録は
+      // 行自体を出さない仕様(buildPriceComparisonLine側で判定)なのでnullフォールバックでよい。
+      try { prices = await pricesPromise; } catch (priceError) { prices = null; }
+      if (requestId !== state.routeRequest || state.route.type !== 'issue' || state.route.code !== code) return;
+      if (!issue) {
+        target.innerHTML = '<div class="card status-card">需給シグナルを計算できません。</div>';
+        return;
+      }
+      renderSignalCard(target, weeks, issue, events, shortFetchFailed, prices);
+    }
+
+    // WATCH PAGE(#/watch。増分9(a)(b))
+    function shortLatestDateOf(events) {
+      if (!events.length) return null;
+      return events.reduce(function (max, event) {
+        return (event && typeof event.date === 'string' && event.date > max) ? event.date : max;
+      }, events[0].date);
+    }
+
+    // 1銘柄分のウォッチカード用データを組み立てる(既存のloadSeries/loadShortShard/loadPricesを再利用。
+    // shard/code単位でキャッシュされるため、銘柄ページと同じ銘柄を後で開いても再フェッチしない)
+    async function computeWatchEntry(code) {
+      const info = state.issueByCode[code];
+      if (!info) return { code: code, retired: true };
+      let weeks = [];
+      let issue = null;
+      let events = [];
+      let shortFetchFailed = false;
+      let prices = null;
+      try {
+        const payload = await loadSeries(info.shard);
+        weeks = payload.weeks;
+        issue = payload.issues[code] || null;
+      } catch (error) {
+        issue = null;
+      }
+      try {
+        const shard = await loadShortShard(code.slice(0, 2));
+        const shortIssue = shard && shard.issues ? shard.issues[code] : null;
+        events = (shortIssue && Array.isArray(shortIssue.events)) ? shortIssue.events : [];
+      } catch (error) {
+        events = [];
+        shortFetchFailed = true;
+      }
+      try { prices = await loadPrices(code); } catch (error) { prices = null; }
+      if (!issue) return { code: code, retired: false, error: true, name: info.name };
+      const signal = computeSignal(weeks, issue, events, shortFetchFailed, prices);
+      return {
+        code: code,
+        retired: false,
+        error: false,
+        name: info.name,
+        signal: signal,
+        latestWeek: weeks.length ? weeks[weeks.length - 1] : null,
+        shortLatestDate: shortLatestDateOf(events),
+        hasPrices: !!prices
+      };
+    }
+
+    // 前回閲覧時の値(seenMap)と現在値を比べ、変化ラベルを付ける。初見(seenMapに記録がない)は
+    // 比較対象が無いため変化なし扱いとする(design指示に明記がないための推測補完。報告のD参照)
+    function computeWatchChangeLabel(entry, seenMap) {
+      if (entry.retired || entry.error) return null;
+      const previous = seenMap[entry.code];
+      if (!previous) return null;
+      const badgeKey = entry.signal.badge.key;
+      if (previous.badge_key && previous.badge_key !== badgeKey) {
+        return 'シグナル変化: ' + (BADGE_LABELS[previous.badge_key] || previous.badge_key) + '→' + entry.signal.badge.label;
+      }
+      const previousShortDate = previous.short_latest_date || null;
+      if (entry.shortLatestDate && (!previousShortDate || entry.shortLatestDate > previousShortDate)) {
+        return '新しい空売り報告';
+      }
+      // latest_weekが進んだだけ(バッジ・空売り最新日に変化なし)は変化グループに入れない
+      return null;
+    }
+
+    function watchEntryByCodeAsc(a, b) {
+      return a.entry.code < b.entry.code ? -1 : (a.entry.code > b.entry.code ? 1 : 0);
+    }
+
+    // reviewer指摘B対応: nextSeenは「今回のcodes一覧」だけのマップを作り直すが、空から作るのではなく
+    // 既存のpreviousSeenへ重ねる形にする。正常に計算できた銘柄だけ新値で上書きし、一時的な
+    // fetch失敗(error)・収録外(retired)の銘柄は前回値をそのまま持ち越す(基準値を消さない)。
+    // ウォッチリストから外れた銘柄(entriesに含まれない)は結果に含まれず、自然にseenから消える。
+    function mergeSeen(entries, previousSeen) {
+      const nextSeen = {};
+      entries.forEach(function (entry) {
+        if (!entry.retired && !entry.error) {
+          nextSeen[entry.code] = {
+            badge_key: entry.signal.badge.key,
+            latest_week: entry.latestWeek,
+            short_latest_date: entry.shortLatestDate
+          };
+        } else if (previousSeen[entry.code]) {
+          nextSeen[entry.code] = previousSeen[entry.code];
+        }
+      });
+      return nextSeen;
+    }
+
+    function renderWatchEntryHtml(diffEntry) {
+      const entry = diffEntry.entry;
+      const changeBannerHtml = diffEntry.changeLabel ? '<p class="watch-change-badge">' + escapeHtml(diffEntry.changeLabel) + '</p>' : '';
+      if (entry.retired) {
+        return '<li class="watch-item watch-item-retired">' +
+          '<div class="watch-item-head"><span class="watch-item-name">' + escapeHtml(entry.code) + '</span><span class="confidence-tag">収録外</span></div>' +
+          '<p class="watch-item-note">現在の収録データにこの銘柄コードが見つかりません(廃止・コード変更などの可能性があります)。</p>' +
+          '<button type="button" class="watch-remove-btn" data-watch-remove="' + escapeHtml(entry.code) + '">ウォッチから外す</button>' +
+        '</li>';
+      }
+      if (entry.error) {
+        return '<li class="watch-item">' +
+          '<a class="watch-item-link" href="#/issue/' + encodeURIComponent(entry.code) + '">' +
+            '<div class="watch-item-head"><span class="watch-item-name">' + escapeHtml(entry.name || entry.code) + '</span><span class="issue-code">' + escapeHtml(entry.code) + '</span></div>' +
+            '<p class="watch-item-note">データを取得できません。</p>' +
+          '</a>' +
+        '</li>';
+      }
+      const evidenceOneLiner = entry.signal.evidence || entry.signal.statusText;
+      return '<li class="watch-item">' +
+        changeBannerHtml +
+        '<a class="watch-item-link" href="#/issue/' + encodeURIComponent(entry.code) + '">' +
+          '<div class="watch-item-head"><span class="watch-item-name">' + escapeHtml(entry.name) + '</span><span class="issue-code">' + escapeHtml(entry.code) + '</span></div>' +
+          '<span class="signal-badge ' + entry.signal.badge.className + '">' + escapeHtml(entry.signal.badge.label) + '</span>' +
+          '<p class="watch-item-evidence">' + escapeHtml(evidenceOneLiner) + '</p>' +
+          confidenceTagsOnlyHtml(entry.hasPrices, entry.signal.shortIndicator.status) +
+        '</a>' +
+      '</li>';
+    }
+
+    async function renderWatchList(codes, requestId) {
+      const target = document.getElementById('watch-list-content');
+      if (!target) return;
+      // reviewer指摘C対応: 銘柄マスタ(issues.json)自体の取得が失敗している場合、state.issueByCodeが
+      // 空のためcomputeWatchEntryは全銘柄を「収録外」と誤判定してしまう。マスタ障害と収録外は別状態
+      // なので、ここで専用メッセージに差し替えて個別カードの計算自体を行わない
+      if (state.issuesError) {
+        target.innerHTML = '<div class="card status-card error">銘柄マスタを取得できません。時間をおいて再読み込みしてください。</div>';
+        return;
+      }
+      if (!codes.length) {
+        target.innerHTML = '<div class="card status-card">ウォッチリストは空です。銘柄ページの「☆ウォッチに追加」から登録できます。</div>';
+        return;
+      }
+      const entries = await Promise.all(codes.map(function (code) { return computeWatchEntry(code); }));
+      if (requestId !== state.routeRequest || state.route.type !== 'watch') return;
+      const seenMap = loadSeen();
+      const diffed = entries.map(function (entry) {
+        return { entry: entry, changeLabel: computeWatchChangeLabel(entry, seenMap) };
+      });
+      const changed = diffed.filter(function (d) { return d.changeLabel; }).sort(watchEntryByCodeAsc);
+      const unchanged = diffed.filter(function (d) { return !d.changeLabel; }).sort(watchEntryByCodeAsc);
+      const noChangeHtml = changed.length ? '' : '<p class="watch-no-change">前回から変化はありません</p>';
+      target.innerHTML = noChangeHtml + '<ul class="watch-list">' +
+        changed.concat(unchanged).map(renderWatchEntryHtml).join('') +
+        '</ul>';
+      // #/watch描画完了時点の現在値でseenを更新する(次回訪問時の比較基準)。
+      // reviewer指摘B対応: 空から作り直すのではなくseenMap(前回値)へ重ねる(mergeSeen)。
+      // 一時的なfetch失敗・収録外の銘柄は前回値を保持し、基準値が消えないようにする
+      saveSeen(mergeSeen(entries, seenMap));
+    }
+
+    function renderWatchPage() {
+      state.currentChart = null;
+      state.currentTaishakuChart = null;
+      const app = document.getElementById('app');
+      const watchlist = loadWatchlist();
+      app.innerHTML = freshnessMarkup() +
+        '<a class="back-link" href="#/">← 銘柄検索へ</a>' +
+        '<div class="hero">' +
+          '<p class="eyebrow">WATCHLIST</p>' +
+          '<h1>ウォッチリスト（' + watchlist.codes.length + '件）</h1>' +
+          '<p class="lead">登録した銘柄の需給シグナルをまとめて確認できます。前回見たときから変化があった銘柄は先頭にまとまります。用語は<a class="guide-link-inline" href="#/guide">用語・見方ガイド</a>を確認してください。</p>' +
+          '<p class="section-subtitle">ウォッチリストはこの端末のブラウザ内にのみ保存されます（他の端末とは同期されません）。</p>' +
+        '</div>' +
+        '<div id="watch-list-content"><div class="card status-card">読み込んでいます…</div></div>';
+      const requestId = ++state.routeRequest;
+      renderWatchList(watchlist.codes, requestId);
+    }
+
+    // GUIDE PAGE(#/guide。増分9(d)。K要望「表示してもよくわからない」への回答。今回の主役)
+    function buildGuideHtml() {
+      return (
+        '<section class="card guide-section" aria-labelledby="guide-1-title">' +
+          '<h2 id="guide-1-title">1. このアプリでわかること</h2>' +
+          '<ul class="guide-list">' +
+            '<li>銘柄ごとに、機関投資家が「株を借りている量」(借株残)の推移を確認できます。</li>' +
+            '<li>発行済株式の0.5%以上の大口空売り残高が、どの機関からどれだけ報告されているかを確認できます。</li>' +
+            '<li>借株残の増減と株価の動きを重ねて見ることで、需給(買いたい人と売りたい人のバランス)の変化をつかみやすくします。</li>' +
+          '</ul>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-2-title">' +
+          '<h2 id="guide-2-title">2. 貸借取引とは</h2>' +
+          '<p>機関投資家(証券会社や運用会社など)は、値下がりしそうな株について「空売り」という取引を行うことがあります。空売りは、次のような流れで行われます。</p>' +
+          '<ul class="guide-list">' +
+            '<li>証券会社などから株を借りる</li>' +
+            '<li>借りた株を市場で売る(自分の持ち株ではなく借りた株を売るので「空」売りと呼びます)</li>' +
+            '<li>株価が下がったところで、同じ株数を買い戻す</li>' +
+            '<li>買い戻した株を貸し手に返す(ここで取引が終わります)</li>' +
+          '</ul>' +
+          '<p>売った値段より安く買い戻せれば差額が利益になり、逆に株価が上がってしまうと損失になります。「借株残(かりかぶざん)」とは、この「借りたままでまだ返していない株」の残高のことです。</p>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-3-title">' +
+          '<h2 id="guide-3-title">3. 残高(ストック)とフロー</h2>' +
+          '<p>「残高(ストック)」は、ある時点で「今どれだけ借りたままになっているか」という量です。「フロー」は、ある期間(たとえば1週間)に「新しくどれだけ動いたか」という量です。</p>' +
+          '<p>たとえるなら、残高はお風呂に溜まっているお湯の量、フローは蛇口から流れ込む水の量のようなものです。お湯の量(残高)が多くても、蛇口(フロー)が今は閉まっていることもあります。</p>' +
+          '<p>現在のシグナルカードは主に残高の変化を見ています。チャートの下の段に、週ごとの新規成約(フロー)の棒グラフを表示しています。</p>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-4-title">' +
+          '<h2 id="guide-4-title">4. 大口空売り残高報告</h2>' +
+          '<p>発行済株式数の0.5%以上を空売りしている機関投資家は、日本取引所グループへ機関名と割合を報告し、公表される決まりになっています(0.5%ルール)。これにより、誰がどれだけ大きな空売りをしているかを確認できます。</p>' +
+          '<p>「報告なし」と表示されていても、空売りが「ゼロ」という意味ではありません。0.5%未満の空売りには公表義務がないため、単に「大口報告の基準に届いていない」だけの可能性があります。</p>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-5-title">' +
+          '<h2 id="guide-5-title">5. シグナルの計算式</h2>' +
+          '<p>バッジは、次の具体的な数字で機械的に決まります。</p>' +
+          '<ul class="guide-list">' +
+            '<li>借株残の4週間の変化率が+10%以上なら「積み上がり」方向、-10%以下なら「解消」方向、その間は「横ばい」</li>' +
+            '<li>大口空売りの割合合計の4週間の変化が+0.5ポイント以上なら「増加」、-0.5ポイント以下なら「減少」、その間は「横ばい」</li>' +
+            '<li>借株残のデータが8週分に満たない銘柄は「データ不足」</li>' +
+            '<li>両方とも積み上がり方向なら「売り圧力 積み上がり」、両方とも解消方向(片方だけ解消でもう片方が横ばいの場合を含む)なら「買い戻し進行」、それ以外は「中立」</li>' +
+          '</ul>' +
+          '<p>なぜ4週間かというと、1週間だけの動きでは日々のブレ(ノイズ)を拾いやすいため、1か月程度の期間で見ることで一時的な増減と本当の傾向を区別しやすくしています。±10%という基準も、小さな変動をすべて「変化あり」とすると情報が多すぎて逆に読みにくくなるため、目立った動きだけを拾うための機械的な目安として設定したものです。</p>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-6-title">' +
+          '<h2 id="guide-6-title">6. 株価との照らし合わせの読み方</h2>' +
+          '<p>9パターンの組み合わせがありますが、要点は次の3行にまとめられます。</p>' +
+          '<ul class="guide-list">' +
+            '<li>株価上昇+借株残の積み増し=綱引き(買い方と売り方が押し合っている状態)</li>' +
+            '<li>株価上昇+借株残の手仕舞い=追い風(上昇を後押しする組み合わせ)</li>' +
+            '<li>株価下落+借株残の積み増し=向かい風(売り圧力が強い組み合わせ)</li>' +
+          '</ul>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-7-title">' +
+          '<h2 id="guide-7-title">7. このデータの限界</h2>' +
+          '<ul class="guide-list">' +
+            '<li>JSDAが集計しているのは「一般貸借」という枠組みのみで、証券会社同士が個別に行う空売り関連の取引は含まれていません。実際の空売りの全量を表しているわけではありません。</li>' +
+            '<li>「転貸」(又貸し)の分は、集計上二重に数えられている可能性があります。残高の絶対値そのものよりも、増えているか減っているかの方向を見るのが実用的な使い方です。</li>' +
+            '<li>発行済株式の0.5%未満の空売りは公表義務がないため、このアプリには表示されません。</li>' +
+            '<li>株価データは、すべての銘柄ではなく、あらかじめ登録された約230銘柄のみに対応しています。</li>' +
+          '</ul>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-8-title">' +
+          '<h2 id="guide-8-title">8. 用語集</h2>' +
+          '<div class="table-wrap"><table class="glossary-table">' +
+            '<thead><tr><th scope="col">用語</th><th scope="col">意味</th></tr></thead>' +
+            '<tbody>' +
+              '<tr><td>大口空売り</td><td>発行済株式数の0.5%以上の空売りポジションのこと。公表義務があります。</td></tr>' +
+              '<tr><td>貸株(かしかぶ)</td><td>証券会社などが株を貸し出すこと。空売りをする人に株を貸す側の行為です。</td></tr>' +
+              '<tr><td>借株残(かりかぶざん)</td><td>借りたまま返していない株の残高。このアプリの需給シグナルの主な材料です。</td></tr>' +
+              '<tr><td>逆日歩(ぎゃくひぶ)</td><td>品貸料とも呼ばれる、株を借りるための追加コストのこと。借りたい人が多く株が不足すると発生します。</td></tr>' +
+              '<tr><td>需給(じゅきゅう)</td><td>「買いたい人」と「売りたい人」のバランスのこと。需要(買い)と供給(売り)を合わせた言葉です。</td></tr>' +
+              '<tr><td>制度信用取引と一般信用取引</td><td>取引所が定めたルールに沿う「制度信用」と、証券会社が個別に条件を決める「一般信用」の2種類。このアプリのJSDAデータは制度信用を含まない「一般貸借」が対象です。日証金カードで表示される「融資残」「貸株残」は、この制度信用取引の残高です。</td></tr>' +
+              '<tr><td>貸借取引(たいしゃくとりひき)</td><td>株や資金を貸し借りする取引全般のこと。このアプリでは主にJSDAが集計する一般貸借を指します。</td></tr>' +
+              '<tr><td>転貸(てんたい)</td><td>借りた株をさらに他社に貸すこと(又貸し)。集計上、同じ株が二重に数えられる原因になります。</td></tr>' +
+              '<tr><td>踏み上げ(ふみあげ)</td><td>ショートスクイーズとも呼ばれます。空売りをしていた投資家が株価上昇で買い戻さざるを得なくなり、それがさらに株価上昇を加速させる現象です。</td></tr>' +
+              '<tr><td>パーセンタイル</td><td>ある値が全体の中でどのくらいの順位にあるかを示す表現。「上位20%」なら、過去のデータの中で上位20%以内に入る高い水準という意味です。</td></tr>' +
+            '</tbody>' +
+          '</table></div>' +
+        '</section>' +
+        '<section class="card guide-section" aria-labelledby="guide-9-title">' +
+          '<h2 id="guide-9-title">9. 日証金(制度信用)カードの見方</h2>' +
+          '<p>個人投資家が信用取引をするとき、多くは「制度信用」という証券取引所が決めた標準ルールに沿った枠組みを使います(証券会社が個別に条件を決める「一般信用」という枠組みもあります)。日証金(日本証券金融株式会社)は、この制度信用取引を裏で支える証券金融会社です。</p>' +
+          '<ul class="guide-list">' +
+            '<li>融資残(ゆうしざん): 信用取引で「買い」を建てている残高のことです。個人投資家が「これから値上がりする」と考えて買っている量の目安になります。</li>' +
+            '<li>貸株残(かしかぶざん): 信用取引で「売り」(空売り)を建てている残高のことです。個人投資家が「これから値下がりする」と考えて売っている量の目安になります。</li>' +
+            '<li>差引(さしひき): 融資残から貸株残を引いた値です。プラスが大きいほど「買い方優勢」、マイナスが大きいほど「売り方優勢」であることを示します。</li>' +
+          '</ul>' +
+          '<p>このアプリの他のカード(貸借残高・大口空売り)はJSDAが集計する機関投資家側のデータですが、日証金カードは個人投資家側の目安です。両方を見比べることで、「機関と個人がそれぞれどちらに傾いているか」がわかりやすくなります。</p>' +
+          '<p>データは2026-07-22の収集開始以降、日ごとに蓄積されていく仕組みです。始まったばかりの銘柄では、表示できる日数がまだ少ないことがあります。</p>' +
+        '</section>'
+      );
+    }
+
+    function renderGuidePage() {
+      state.currentChart = null;
+      state.currentTaishakuChart = null;
+      const app = document.getElementById('app');
+      app.innerHTML = freshnessMarkup() +
+        '<a class="back-link" href="#/">← トップへ</a>' +
+        '<div class="hero">' +
+          '<p class="eyebrow">GUIDE</p>' +
+          '<h1>用語・見方ガイド</h1>' +
+          '<p class="lead">需給ナビの数値や用語の意味を、できるだけやさしい言葉で説明します。</p>' +
+        '</div>' +
+        buildGuideHtml() +
+        '<p class="note">このガイドは仕組みの説明であり、投資助言ではありません。売買の判断はご自身でお願いします。</p>';
+    }
+
+    function render() {
+      state.routeRequest += 1;
+      if (state.route.type === 'issue') renderIssuePage(state.route.code);
+      else if (state.route.type === 'watch') renderWatchPage();
+      else if (state.route.type === 'guide') renderGuidePage();
+      else renderSearchPage();
+    }
+
+    // EVENTS
+    function handleInput(event) {
+      if (event.target && event.target.id === 'issue-search') {
+        state.query = event.target.value;
+        patchSearchResults();
+      }
+    }
+
+    function handleClick(event) {
+      const toggleButton = event.target.closest('[data-watch-toggle]');
+      if (toggleButton) {
+        toggleWatch(toggleButton.getAttribute('data-watch-toggle'));
+        return;
+      }
+      const removeButton = event.target.closest('[data-watch-remove]');
+      if (removeButton) {
+        removeFromWatchlist(removeButton.getAttribute('data-watch-remove'));
+        if (state.route.type === 'watch') render(); // 一覧からその場で消えるよう再描画
+      }
+    }
+
+    function handleRouteChange() {
+      state.route = getRoute();
+      render();
+      window.scrollTo(0, 0);
+    }
+
+    function handleResize() {
+      if ((!state.currentChart && !state.currentTaishakuChart) || state.resizeFrame) return;
+      state.resizeFrame = window.requestAnimationFrame(function () {
+        state.resizeFrame = 0;
+        const chart = document.getElementById('series-chart');
+        if (chart && state.currentChart) drawChart(chart, state.currentChart.weeks, state.currentChart.issue, state.currentChart.priceValues, state.currentChart.shortMarkers);
+        const flowChart = document.getElementById('flow-chart');
+        if (flowChart && state.currentChart && state.currentChart.flow) {
+          drawFlowChart(flowChart, state.currentChart.weeks, state.currentChart.flow.values, state.currentChart.flow.surgeFlags, state.currentChart.hasPriceValues);
+        }
+        const taishakuChart = document.getElementById('taishaku-chart');
+        if (taishakuChart && state.currentTaishakuChart) {
+          drawTaishakuChart(taishakuChart, state.currentTaishakuChart.dates, state.currentTaishakuChart.yushiZan, state.currentTaishakuChart.kashikabuZan);
+        }
+      });
+    }
+
+    // INIT
+    async function prepareServiceWorker() {
+      if (!('serviceWorker' in navigator)) return;
+      try {
+        await navigator.serviceWorker.register('sw.js');
+        await navigator.serviceWorker.ready;
+        if (navigator.serviceWorker.controller) return;
+        await new Promise(function (resolve) {
+          let timeoutId = 0;
+          const finish = function () {
+            navigator.serviceWorker.removeEventListener('controllerchange', finish);
+            window.clearTimeout(timeoutId);
+            resolve();
+          };
+          navigator.serviceWorker.addEventListener('controllerchange', finish);
+          timeoutId = window.setTimeout(finish, 2000);
+        });
+      } catch (error) {
+        console.warn('Service Worker registration failed:', error);
+      }
+    }
+
+    async function init() {
+      document.addEventListener('input', handleInput);
+      document.addEventListener('click', handleClick);
+      window.addEventListener('hashchange', handleRouteChange);
+      window.addEventListener('resize', handleResize, { passive: true });
+      state.route = getRoute();
+
+      await prepareServiceWorker();
+      await Promise.all([
+        loadMeta().catch(function (error) { state.metaError = error; }),
+        loadIssues().catch(function (error) { state.issuesError = error; })
+      ]);
+      render();
+    }
+
+    init();
+  </script>
+</body>
+</html>
