@@ -407,6 +407,155 @@ class BuildSiteTests(unittest.TestCase):
     def test_signals_all_short_false_when_short_dir_missing(self):
         self._write_week("2026-07-10")
         build_site.build_site(
+            self.weekly_dir,
+            self.out_dir,
+            GENERATED_AT,
+            price_list_path=self.root / "no-such-price-list.json",
+        )  # short_dir未指定 -> out_dir/short(存在しない)に既定される
+
+        signals = self._read_output("signals.json")
+        self.assertTrue(signals["issues"])
+        for issue in signals["issues"].values():
+            self.assertFalse(issue["short"])
+            self.assertFalse(issue["price"])
+
+    def test_signals_writer_does_not_disturb_other_outputs(self):
+        # 増分13追加後も既存出力(series/issues/meta)は無傷であることの回帰確認
+        self._write_week("2026-07-10")
+        build_site.build_site(
+            self.weekly_dir,
+            self.out_dir,
+            GENERATED_AT,
+            price_list_path=self.root / "no-such-price-list.json",
+        )
+        self.assertTrue((self.out_dir / "issues.json").is_file())
+        self.assertTrue((self.out_dir / "meta.json").is_file())
+        self.assertTrue((self.out_dir / "series" / "28.json").is_file())
+        self.assertTrue((self.out_dir / "signals.json").is_file())
+
+    # ---- reviewer指摘B(2026-07-25、差し戻し分): 不正日付イベントの寛容フィルタ
+
+    def test_short_indicator_malformed_date_event_is_ignored_not_crashed(self):
+        # "2026-07-99"は^\d{4}-\d{2}-\d{2}$の形には合致するが暦として存在しない。
+        # 未捕捉ValueErrorで週次ビルド全体を落とさず、そのイベントだけ無視する
+        events = [
+            {"date": "2026-07-99", "ratio": 0.5, "seller": "Broken"},
+            {"date": "2026-06-20", "ratio": 0.010, "seller": "A"},
+            {"date": "2026-07-22", "ratio": 0.020, "seller": "A"},
+        ]
+        indicator = build_site._compute_short_indicator(events)  # 例外にならない
+        self.assertEqual(indicator["status"], "ok")
+        self.assertEqual(indicator["direction"], "increase")
+
+    def test_short_indicator_only_malformed_dates_degrades_to_none(self):
+        events = [
+            {"date": "2026-07-99", "ratio": 0.5, "seller": "Broken"},
+            {"date": "not-a-date", "ratio": 0.2, "seller": "AlsoBroken"},
+        ]
+        indicator = build_site._compute_short_indicator(events)
+        self.assertEqual(indicator["status"], "none")
+        self.assertEqual(indicator["direction"], "neutral")
+
+    def test_is_valid_ymd_rejects_shape_only_matches(self):
+        self.assertFalse(build_site._is_valid_ymd("2026-07-99"))
+        self.assertFalse(build_site._is_valid_ymd("2026-13-01"))
+        self.assertFalse(build_site._is_valid_ymd("not-a-date"))
+        self.assertFalse(build_site._is_valid_ymd(20260722))
+        self.assertTrue(build_site._is_valid_ymd("2026-07-22"))
+
+    def test_build_site_does_not_crash_when_short_shard_has_malformed_event(self):
+        # 統合確認: 壊れたイベントが1件混ざっていてもbuild_site全体は落ちない
+        self._write_week("2026-07-10")
+        short_dir = self.root / "short"
+        short_dir.mkdir()
+        (short_dir / "28.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "supply_demand_short_v1",
+                    "issues": {
+                        "285A": {
+                            "name": "キオクシアホールディングス",
+                            "events": [
+                                {
+                                    "date": "2026-07-99",
+                                    "ratio": 0.5,
+                                    "qty": 1,
+                                    "seller": "Broken",
+                                },
+                                {
+                                    "date": "2026-07-08",
+                                    "ratio": 0.012,
+                                    "qty": 1000,
+                                    "seller": "A",
+                                },
+                            ],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        build_site.build_site(
+            self.weekly_dir,
+            self.out_dir,
+            GENERATED_AT,
+            short_dir=short_dir,
+            price_list_path=self.root / "no-such-price-list.json",
+        )
+        signals = self._read_output("signals.json")
+        self.assertTrue(signals["issues"]["285A"]["short"])  # 有効イベント分は反映
+
+    # ---- reviewer指摘C(2026-07-25、差し戻し分): バッジ組合せの直接検証 ------
+
+    def _indicator(self, direction, status="ok"):
+        return {"status": status, "direction": direction}
+
+    def test_badge_pressure_up_requires_both_increase(self):
+        badge = build_site._compute_badge(
+            self._indicator("increase"), self._indicator("increase")
+        )
+        self.assertEqual(badge, "pressure-up")
+
+    def test_badge_covering_decrease_decrease(self):
+        badge = build_site._compute_badge(
+            self._indicator("decrease"), self._indicator("decrease")
+        )
+        self.assertEqual(badge, "covering")
+
+    def test_badge_covering_decrease_neutral(self):
+        badge = build_site._compute_badge(
+            self._indicator("decrease"), self._indicator("neutral")
+        )
+        self.assertEqual(badge, "covering")
+
+    def test_badge_covering_neutral_decrease(self):
+        badge = build_site._compute_badge(
+            self._indicator("neutral"), self._indicator("decrease")
+        )
+        self.assertEqual(badge, "covering")
+
+    def test_badge_neutral_for_mixed_or_all_neutral_combinations(self):
+        mixed_combinations = [
+            ("increase", "decrease"),
+            ("increase", "neutral"),
+            ("neutral", "increase"),
+            ("decrease", "increase"),
+            ("neutral", "neutral"),
+        ]
+        for d1, d3 in mixed_combinations:
+            with self.subTest(d1=d1, d3=d3):
+                badge = build_site._compute_badge(
+                    self._indicator(d1), self._indicator(d3)
+                )
+                self.assertEqual(badge, "neutral")
+
+    def test_badge_insufficient_overrides_short_direction(self):
+        badge = build_site._compute_badge(
+            {"status": "insufficient", "direction": "neutral"},
+            self._indicator("increase"),
+        )
+        self.assertEqual(badge, "insufficient")
+
 
 if __name__ == "__main__":
     unittest.main()
