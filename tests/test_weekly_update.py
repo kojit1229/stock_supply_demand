@@ -198,6 +198,57 @@ class WeeklyUpdateTests(unittest.TestCase):
         )
         self.assertEqual((self.data / "meta.json").read_bytes(), before_meta)
 
+    def test_short_shard_at_output_root_is_reflected_in_signals(self):
+        # reviewer指摘A(2026-07-25、条件付き合格からの差し戻し): build_site()
+        # 呼び出しがstaged_output(使い捨てstageディレクトリ)を渡すため、
+        # short_dirの既定値``<out_dir>/short``がそこへ解決され、実データの置き場
+        # (output_root/short)が反映されず週次cron経路ではsignals.jsonのshortが
+        # 常にfalseになっていた(reviewerがdata/short/28.jsonへ実イベントを置いた
+        # 再現実験で検出)。この再現手順そのものをテスト化し、修正後は正しく
+        # 反映されることを固定する
+        short_dir = self.data / "short"
+        short_dir.mkdir(parents=True)
+        (short_dir / "28.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "supply_demand_short_v1",
+                    "issues": {
+                        "285A": {
+                            "name": "キオクシアホールディングス",
+                            "events": [
+                                {
+                                    "date": "2026-07-08",
+                                    "ratio": 0.012,
+                                    "qty": 1000,
+                                    "seller": "Test Fund",
+                                }
+                            ],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        downloader = FixtureDownloader(index_for("2026-07-10"))
+        result = weekly_update.run_weekly_update(
+            self.data,
+            self.cache,
+            downloader=downloader,
+            generated_at="2026-07-22T00:00:00Z",
+            price_list_path=self.root / "no-such-price-list.json",
+        )
+
+        self.assertEqual(result.updated_weeks, ("2026-07-10",))
+        signals = json.loads((self.data / "signals.json").read_text(encoding="utf-8"))
+        kioxia = signals["issues"]["285A"]
+        self.assertTrue(kioxia["short"])  # 修正前はここが常にFalseだった
+        # 借株残の履歴は今回の新規週1件のみ(有効週<8)なのでbadgeはinsufficientの
+        # ままになるのが正しい(borrow側の有効週不足はshort側の修正と無関係)
+        self.assertEqual(kioxia["badge"], "insufficient")
+        # shortディレクトリ自体はbuild_siteの書き込み対象外なので無傷のはず
+        self.assertTrue((self.data / "short" / "28.json").is_file())
+
     def test_validation_failure_exits_one_without_output_files(self):
         downloader = FixtureDownloader(
             index_for("2026-07-10"), invalid_s={"20260710s.xlsx"}
