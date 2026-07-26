@@ -155,10 +155,22 @@ def run_weekly_update(
     meta_path: str | os.PathLike[str] | None = None,
     downloader: backfill_jsda.CachedDownloader | None = None,
     generated_at: str | None = None,
+    short_dir: str | os.PathLike[str] | None = None,
+    price_list_path: str | os.PathLike[str] = "config/price_list.json",
 ) -> WeeklyUpdateResult:
-    """Discover, validate, and atomically add all eligible complete weeks."""
+    """Discover, validate, and atomically add all eligible complete weeks.
+
+    ``short_dir``/``price_list_path``はbuild_site()のsignals.json算出用
+    (増分13)。build_site()自身の既定値(``<out_dir>/short``)は、ここでは
+    build_site()を使い捨てのstage/builtディレクトリに対して呼ぶため実データの
+    short/には解決されない(reviewer指摘A、2026-07-25)。そのため必ず
+    ``output_root/short``(実データの置き場)を明示的に渡す。既定は
+    ``output_root / "short"`` で、price_list_pathはbuild_site()と同じCWD相対
+    既定(``config/price_list.json``)を明示的に踏襲する。
+    """
     output_root = Path(out_dir)
     cache_root = Path(cache_dir)
+    resolved_short_dir = Path(short_dir) if short_dir is not None else output_root / "short"
     meta = Path(meta_path) if meta_path is not None else output_root / "meta.json"
     latest_week = _read_latest_week(meta)
     fetcher = downloader or backfill_jsda.CachedDownloader()
@@ -229,7 +241,11 @@ def run_weekly_update(
 
         staged_output = stage / "built"
         outputs = build_site.build_site(
-            staged_weekly, staged_output, generated_at or _generated_at()
+            staged_weekly,
+            staged_output,
+            generated_at or _generated_at(),
+            short_dir=resolved_short_dir,
+            price_list_path=price_list_path,
         )
         _commit_weekly_and_outputs(
             output_root,
@@ -253,11 +269,24 @@ def _main(argv: list[str] | None = None) -> int:
         "--meta",
         help="latest_weekを読むmeta.json (省略時は--out配下のmeta.json)",
     )
+    parser.add_argument(
+        "--short-dir",
+        help="signals.json算出用のJPX short shard置き場 (省略時は--out配下のshort)",
+    )
+    parser.add_argument(
+        "--price-list",
+        default="config/price_list.json",
+        help="signals.json算出用のprice_list.json (欠落は許容)",
+    )
     args = parser.parse_args(argv)
 
     try:
         result = run_weekly_update(
-            args.out, args.cache_dir, meta_path=args.meta
+            args.out,
+            args.cache_dir,
+            meta_path=args.meta,
+            short_dir=args.short_dir,
+            price_list_path=args.price_list,
         )
     except Exception as exc:
         print(f"weekly_update: {exc}", file=sys.stderr)
