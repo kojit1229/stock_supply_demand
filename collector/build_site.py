@@ -357,7 +357,80 @@ def _sum_latest_ratio_as_of(
             any_found = True
     return total if any_found else None
 
+
+def _compute_short_indicator(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """index.htmlのcomputeShortIndicator(fetchFailed=falseの経路のみ。builder
+    側はfetchではなくファイル読み込みなので'error'状態は無い)と同一。
+
+    reviewer指摘B(2026-07-25): dateが``^\\d{4}-\\d{2}-\\d{2}$``の形をしていても
+    暦として不正(例: "2026-07-99")だと``date.fromisoformat``が未捕捉
+    ValueErrorになり得るため、有効イベントの寛容フィルタ(既存の「1イベント
+    単位の不正は無視」方針)の時点でこのチェックも行い、以降の計算では
+    valid_eventsのdateが常にfromisoformatで解釈可能であることを保証する。
+    """
+    valid_events = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and _is_valid_ymd(event.get("date"))
+        and isinstance(event.get("seller"), str)
+    ]
+    if not valid_events:
+        return {"status": "none", "direction": "neutral", "sum_latest": None}
+    latest_date = max(event["date"] for event in valid_events)
+    sum_latest = _sum_latest_ratio_as_of(valid_events, latest_date)
+    if sum_latest is None:
+        return {"status": "none", "direction": "neutral", "sum_latest": None}
+    prior_date = (date.fromisoformat(latest_date) - timedelta(days=28)).isoformat()
+    sum_prior = _sum_latest_ratio_as_of(valid_events, prior_date)
+    if sum_prior is None:
+        return {"status": "no-history", "direction": "neutral", "sum_latest": sum_latest}
+    delta_pt = (sum_latest - sum_prior) * 100
+    if delta_pt >= SHORT_RATIO_THRESHOLD_PT:
+        direction = "increase"
+    elif delta_pt <= -SHORT_RATIO_THRESHOLD_PT:
+        direction = "decrease"
+    else:
+        direction = "neutral"
+    return {"status": "ok", "direction": direction, "sum_latest": sum_latest}
+
+
+def _compute_badge(borrow_indicator: dict[str, Any], short_indicator: dict[str, Any]) -> str:
+    """index.htmlのcomputeSignalBadgeと同一の4値規則。"""
+    if borrow_indicator["status"] == "insufficient":
+        return "insufficient"
+    d1 = borrow_indicator["direction"]
+    d3 = short_indicator["direction"]
+    if d1 == "increase" and d3 == "increase":
+        return "pressure-up"
+    if (d1, d3) in (("decrease", "decrease"), ("decrease", "neutral"), ("neutral", "decrease")):
+        return "covering"
+    return "neutral"
+
+
+def _compute_signal(
+    series: dict[str, list[int | None]],
+    events: list[dict[str, Any]],
+    price_codes: set[str],
+    code: str,
+) -> dict[str, Any]:
+    borrow = _borrow_series(series)
+    borrow_indicator = _compute_borrow_indicator(borrow)
+    short_indicator = _compute_short_indicator(events)
+    sum_latest = short_indicator["sum_latest"]
+    return {
+        "badge": _compute_badge(borrow_indicator, short_indicator),
+        "borrow_chg": borrow_indicator["change_ratio"],
+        "short": bool(sum_latest is not None and sum_latest > 0),
+        "price": code in price_codes,
+    }
+
+
 def _assemble_outputs(
+    documents: list[dict[str, Any]],
+    generated_at: str,
+    short_events: dict[str, list[dict[str, Any]]],
+    price_codes: set[str],
 ) -> dict[str, dict[str, Any]]:
     retained = documents[-MAX_WEEKS:]
     weeks = [document["report_date"] for document in retained]
@@ -379,6 +452,7 @@ def _assemble_outputs(
     }
 
     shard_issues: dict[str, dict[str, Any]] = {}
+    signals_issues: dict[str, dict[str, Any]] = {}
     for code in sorted(latest_names):
         series = {field: [] for field in _SERIES_FIELDS}
         for field in _S_SERIES_FIELDS:
@@ -402,6 +476,11 @@ def _assemble_outputs(
             "name": latest_names[code],
             **series,
         }
+        # 増分13: series構築と同じループ内でown_qty/ten_qtyを再利用してsignalsも
+        # 算出する(ファイル再読み込み無し)
+        signals_issues[code] = _compute_signal(
+            series, short_events.get(code, []), price_codes, code
+        )
 
     for shard in sorted(shard_issues):
         outputs[f"series/{shard}.json"] = {
@@ -409,6 +488,12 @@ def _assemble_outputs(
             "weeks": weeks,
             "issues": shard_issues[shard],
         }
+
+    outputs["signals.json"] = {
+        "schema_version": SIGNALS_SCHEMA_VERSION,
+        "week": weeks[-1],
+        "issues": signals_issues,
+    }
 
     outputs["meta.json"] = {
         "schema_version": META_SCHEMA_VERSION,
@@ -424,6 +509,8 @@ def _write_outputs(out_dir: Path, outputs: dict[str, dict[str, Any]]) -> None:
     """Replace only builder-owned outputs, preserving sibling data directories.
 
     外部利用者あり: collector/weekly_update.py が原子的コミットのため直接呼ぶ。
+    シグネチャ・対象(issues.json/meta.json/series/signals.json)を変える際は
+    同ファイルも更新すること。
     """
     if out_dir.exists() and not out_dir.is_dir():
         raise BuildSiteError(f"output path is not a directory: {out_dir}")
@@ -445,6 +532,7 @@ def _write_outputs(out_dir: Path, outputs: dict[str, dict[str, Any]]) -> None:
             staged_path.write_text(text, encoding="utf-8")
 
         out_dir.mkdir(parents=True, exist_ok=True)
+        targets = ("issues.json", "meta.json", "series", "signals.json")
         for name in targets:
             target = out_dir / name
             if target.exists() or target.is_symlink():
@@ -489,9 +577,26 @@ def build_site(
     weekly_dir: str | os.PathLike[str],
     out_dir: str | os.PathLike[str],
     generated_at: str,
+    *,
+    short_dir: str | os.PathLike[str] | None = None,
+    price_list_path: str | os.PathLike[str] = "config/price_list.json",
 ) -> dict[str, dict[str, Any]]:
+    """Validate weekly snapshots and write all deployed builder outputs.
+
+    ``short_dir``(既定: ``out_dir/short``)と``price_list_path``(既定:
+    ``config/price_list.json``、CWD相対でprices.pyのCLI既定と同じ流儀)は
+    増分13のsignals.json算出用。どちらも欠落は許容(短絡してshort全false・
+    price全false扱いにする、ローカルにdaily.ymlの生成物が無い環境でも週次
+    ビルドが通るように)。存在するのに壊れている場合はフェイルラウドする。
+    """
     _validate_generated_at(generated_at)
     documents = _load_weekly_documents(Path(weekly_dir))
+    out_root = Path(out_dir)
+    resolved_short_dir = Path(short_dir) if short_dir is not None else out_root / "short"
+    short_events = _load_short_events(resolved_short_dir)
+    price_codes = _load_price_codes(Path(price_list_path))
+    outputs = _assemble_outputs(documents, generated_at, short_events, price_codes)
+    _write_outputs(out_root, outputs)
     return outputs
 
 
@@ -507,10 +612,27 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--weekly-dir", required=True, help="directory of weekly JSON files")
     parser.add_argument("--out-dir", required=True, help="output data directory")
     parser.add_argument("--generated-at", help="ISO 8601 generation timestamp")
+    parser.add_argument(
+        "--short-dir",
+        help="JPX short-position shard directory for signals.json "
+        "(default: <out-dir>/short; missing is OK, malformed is fatal)",
+    )
+    parser.add_argument(
+        "--price-list",
+        default="config/price_list.json",
+        help="price_list.json for signals.json (missing is OK, malformed is fatal)",
+    )
     args = parser.parse_args(argv)
 
     generated_at = args.generated_at if args.generated_at is not None else _default_generated_at()
     try:
+        build_site(
+            args.weekly_dir,
+            args.out_dir,
+            generated_at,
+            short_dir=args.short_dir,
+            price_list_path=args.price_list,
+        )
     except (BuildSiteError, OSError) as exc:
         print(f"build_site: {exc}", file=sys.stderr)
         return 1
