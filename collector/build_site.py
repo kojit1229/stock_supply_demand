@@ -16,7 +16,7 @@ import shutil
 import sys
 import tempfile
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,7 @@ WEEKLY_SCHEMA_VERSION = "supply_demand_weekly_v1"
 ISSUES_SCHEMA_VERSION = "supply_demand_issues_v1"
 SERIES_SCHEMA_VERSION = "supply_demand_series_v1"
 META_SCHEMA_VERSION = "supply_demand_meta_v1"
+SIGNALS_SCHEMA_VERSION = 1
 MAX_WEEKS = 160
 
 _SERIES_FIELDS = ("lend_qty", "own_qty", "ten_qty", "lend_amt")
@@ -42,6 +43,13 @@ _TAISHAKU_FIELDS = (
     "ten_amt",
 )
 _COLLATERAL_TYPES = ("yutanpo", "mutanpo")
+
+# 増分13(2026-07-24確定、design.md §4 signals.json): index.htmlのcomputeSignal系
+# 関数群と同一閾値(PWAのシグナルカードと判定を一致させるため、境界値も含め
+# 完全に同じ規則をPython側で再実装する)
+MIN_VALID_WEEKS = 8  # 借株残の有効週(非null週)数がこれ未満なら'insufficient'
+BORROW_CHANGE_THRESHOLD = 0.10  # 借株残4週変化率 ±10%
+SHORT_RATIO_THRESHOLD_PT = 0.5  # 空売り合計ratio 4週前比 ±0.5pt
 
 
 class BuildSiteError(ValueError):
@@ -208,8 +216,148 @@ def _null_safe_sum(*values: int | None) -> int | None:
     return sum(present) if present else None
 
 
+# ---------------------------------------------------------------------------
+# 増分13: signals.json(design.md §4)。判定ロジックはindex.htmlの
+# computeBorrowIndicator/computeShortIndicator/computeSignalBadgeと同一閾値
+# (境界値含む)で移植する。**順位・スコアは持たせない**契約なので、算出結果は
+# badge/borrow_chg/short/priceの4項目のみ返す。
+# ---------------------------------------------------------------------------
+
+
+def _load_price_codes(price_list_path: Path) -> set[str]:
+    """Load config/price_list.json's codes. Missing file -> empty set (no
+    price list means every issue's ``price`` flag is False; not an error, so
+    a local checkout without the file can still build signals.json). A
+    present-but-malformed file still fails loud."""
+    if not price_list_path.exists():
+        return set()
+    try:
+        raw = price_list_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BuildSiteError(f"price_listを読めません: {price_list_path}") from exc
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise BuildSiteError(f"price_listがJSONとして不正です: {price_list_path}") from exc
+    if not isinstance(document, dict):
+        raise BuildSiteError(f"price_listがJSONオブジェクトではありません: {price_list_path}")
+    codes = document.get("codes")
+    if not isinstance(codes, list):
+        raise BuildSiteError(f"price_listのcodesが不正です: {price_list_path}")
+    validated: set[str] = set()
+    for code in codes:
+        if not isinstance(code, str) or _CODE_PATTERN.fullmatch(code) is None:
+            raise BuildSiteError(f"price_listの銘柄コードが不正です: {code!r}")
+        validated.add(code)
+    return validated
+
+
+def _load_short_events(short_dir: Path) -> dict[str, list[dict[str, Any]]]:
+    """Load every short/{XX}.json shard into a flat code->events map.
+
+    Missing directory -> empty map (no short data means every issue's short
+    indicator is 'none'/neutral; not an error, so a local checkout without a
+    daily short/ pull can still build signals.json). A present-but-malformed
+    shard file still fails loud; individual malformed *events* are instead
+    filtered defensively inside the indicator functions below, mirroring
+    index.html's own tolerant `events.filter(...)`.
+    """
+    if not short_dir.is_dir():
+        return {}
+    events_by_code: dict[str, list[dict[str, Any]]] = {}
+    for path in sorted(short_dir.glob("*.json")):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise BuildSiteError(f"shortシャードを読めません: {path}") from exc
+        if not isinstance(document, dict):
+            raise BuildSiteError(f"shortシャードがオブジェクトではありません: {path}")
+        issues = document.get("issues")
+        if not isinstance(issues, dict):
+            raise BuildSiteError(f"shortシャードのissuesが不正です: {path}")
+        for code, issue in issues.items():
+            if not isinstance(issue, dict) or not isinstance(issue.get("events"), list):
+                raise BuildSiteError(f"shortシャードの銘柄データが不正です: {path} {code!r}")
+            events_by_code[code] = issue["events"]
+    return events_by_code
+
+
+def _borrow_series(series: dict[str, list[int | None]]) -> list[float | None]:
+    """index.htmlのborrowBalanceSeries: own_qty+ten_qtyを週ごとに合算し、
+    どちらかがnullならnull(0扱いにしない、欠測伝播)。"""
+    own = series["own_qty"]
+    ten = series["ten_qty"]
+    return [
+        (own[index] + ten[index]) if own[index] is not None and ten[index] is not None else None
+        for index in range(len(own))
+    ]
+
+
+def _compute_borrow_indicator(borrow: list[float | None]) -> dict[str, Any]:
+    """index.htmlのcomputeBorrowIndicatorと同一(境界値含む)。"""
+    valid_count = sum(1 for value in borrow if value is not None)
+    if valid_count < MIN_VALID_WEEKS:
+        return {"status": "insufficient", "direction": "neutral", "change_ratio": None}
+    latest_index = len(borrow) - 1
+    compare_index = latest_index - 4
+    latest = borrow[latest_index]
+    compare = borrow[compare_index] if compare_index >= 0 else None
+    if latest is None or compare is None or compare == 0:
+        return {"status": "unavailable", "direction": "neutral", "change_ratio": None}
+    change_ratio = (latest - compare) / compare
+    if change_ratio >= BORROW_CHANGE_THRESHOLD:
+        direction = "increase"
+    elif change_ratio <= -BORROW_CHANGE_THRESHOLD:
+        direction = "decrease"
+    else:
+        direction = "neutral"
+    return {"status": "ok", "direction": direction, "change_ratio": change_ratio}
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+_YMD_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _is_valid_ymd(value: Any) -> bool:
+    """True iff ``value`` is a genuinely valid YYYY-MM-DD date string.
+
+    形だけの正規表現一致(例: "2026-07-99")は``date.fromisoformat``で弾く。
+    """
+    if not isinstance(value, str) or _YMD_PATTERN.match(value) is None:
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _sum_latest_ratio_as_of(
+    events: list[dict[str, Any]], as_of_date: str
+) -> float | None:
+    """index.htmlのsumLatestRatioAsOf: 報告者ごとの「基準日以前の最新イベント」
+    のratioを合算する(below_thresholdのratio 0.0もそのまま加算)。報告が
+    1件も無ければNone。"""
+    by_seller: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if event["date"] > as_of_date:
+            continue
+        current = by_seller.get(event["seller"])
+        if current is None or event["date"] > current["date"]:
+            by_seller[event["seller"]] = event
+    total = 0.0
+    any_found = False
+    for event in by_seller.values():
+        ratio = event.get("ratio")
+        if _is_number(ratio):
+            total += ratio
+            any_found = True
+    return total if any_found else None
+
 def _assemble_outputs(
-    documents: list[dict[str, Any]], generated_at: str
 ) -> dict[str, dict[str, Any]]:
     retained = documents[-MAX_WEEKS:]
     weeks = [document["report_date"] for document in retained]
@@ -276,7 +424,6 @@ def _write_outputs(out_dir: Path, outputs: dict[str, dict[str, Any]]) -> None:
     """Replace only builder-owned outputs, preserving sibling data directories.
 
     外部利用者あり: collector/weekly_update.py が原子的コミットのため直接呼ぶ。
-    シグネチャ・対象(issues.json/meta.json/series)を変える際は同ファイルも更新すること。
     """
     if out_dir.exists() and not out_dir.is_dir():
         raise BuildSiteError(f"output path is not a directory: {out_dir}")
@@ -298,7 +445,6 @@ def _write_outputs(out_dir: Path, outputs: dict[str, dict[str, Any]]) -> None:
             staged_path.write_text(text, encoding="utf-8")
 
         out_dir.mkdir(parents=True, exist_ok=True)
-        targets = ("issues.json", "meta.json", "series")
         for name in targets:
             target = out_dir / name
             if target.exists() or target.is_symlink():
@@ -344,11 +490,8 @@ def build_site(
     out_dir: str | os.PathLike[str],
     generated_at: str,
 ) -> dict[str, dict[str, Any]]:
-    """Validate weekly snapshots and write all deployed builder outputs."""
     _validate_generated_at(generated_at)
     documents = _load_weekly_documents(Path(weekly_dir))
-    outputs = _assemble_outputs(documents, generated_at)
-    _write_outputs(Path(out_dir), outputs)
     return outputs
 
 
@@ -368,7 +511,6 @@ def _main(argv: list[str] | None = None) -> int:
 
     generated_at = args.generated_at if args.generated_at is not None else _default_generated_at()
     try:
-        build_site(args.weekly_dir, args.out_dir, generated_at)
     except (BuildSiteError, OSError) as exc:
         print(f"build_site: {exc}", file=sys.stderr)
         return 1
