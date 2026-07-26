@@ -168,26 +168,47 @@
     }
 
     #issue-search::placeholder { color: #718493; }
+
+    .filter-panel { margin: 0 0 14px; }
+    .filter-chip-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+    .filter-chip {
+      padding: 7px 13px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface);
+      color: var(--muted);
+      font-size: .82rem;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .filter-chip-active { border-color: var(--decrease); background: rgba(63, 163, 124, .14); color: var(--text); font-weight: 650; }
+    .filter-note { margin: 4px 2px 0; color: var(--muted); font-size: .74rem; }
+
     .result-summary { min-height: 1.6em; margin: 0 2px 10px; color: var(--muted); font-size: .82rem; }
     .result-list { display: grid; margin: 0; padding: 0; gap: 8px; list-style: none; }
 
     .result-link {
-      display: grid;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
       padding: 14px 16px;
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: center;
-      gap: 12px;
       border: 1px solid var(--border);
       border-radius: 11px;
       background: var(--surface);
       text-decoration: none;
       transition: border-color .15s ease, transform .15s ease;
     }
+    .result-link-main { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; }
 
     .result-link:hover,
     .result-link:focus-visible { border-color: var(--decrease); transform: translateY(-1px); }
     .result-name { overflow: hidden; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
     .issue-code { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9rem; font-weight: 700; }
+    .result-badge { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: .74rem; }
+    .badge-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+    .badge-dot-orange { background: var(--warning); }
+    .badge-dot-blue { background: var(--series-ten); }
+    .badge-dot-gray { background: var(--muted); }
 
     .card {
       margin-top: 16px;
@@ -473,7 +494,8 @@
       short: function (shard) { return 'data/short/' + shard + '.json'; },
       shortMeta: 'data/short_meta.json',
       prices: function (code) { return 'data/prices/' + code + '.json'; },
-      taishakuSeries: function (shard) { return 'data/taishaku_series/' + shard + '.json'; }
+      taishakuSeries: function (shard) { return 'data/taishaku_series/' + shard + '.json'; },
+      signals: 'data/signals.json'
     });
     const SHORT_HISTORY_LIMIT = 20;
     const SERIES = Object.freeze([
@@ -515,6 +537,21 @@
       'covering': '買い戻し進行',
       'neutral': '中立',
       'insufficient': 'データ不足'
+    });
+
+    // 増分13 PWA側: 条件フィルタ検索(v2-policy.md 論点A裁定=順位・スコアなし。表示順はコード順のまま)
+    // 選択肢の順序は依頼文の指定通り([すべて][買い戻し進行][売り圧力 積み上がり][中立]。insufficientは出さない)
+    const FILTER_BADGE_OPTIONS = Object.freeze([
+      { key: 'all', label: 'すべて' },
+      { key: 'covering', label: BADGE_LABELS.covering },
+      { key: 'pressure-up', label: BADGE_LABELS['pressure-up'] },
+      { key: 'neutral', label: BADGE_LABELS.neutral }
+    ]);
+    const SIGNAL_BADGE_DOT_CLASS = Object.freeze({
+      'pressure-up': 'badge-dot-orange',
+      'covering': 'badge-dot-blue',
+      'neutral': 'badge-dot-gray',
+      'insufficient': 'badge-dot-gray'
     });
 
     function escapeHtml(value) {
@@ -633,7 +670,15 @@
       currentChart: null,
       currentTaishakuChart: null,
       routeRequest: 0,
-      resizeFrame: 0
+      resizeFrame: 0,
+      // 増分13: 条件フィルタ(検索ページのみで使う)。既定(all/off/off)ではsignals.jsonを一切fetchしない
+      signals: null,
+      signalsError: null,
+      signalsErrorPending: false,
+      signalsLoading: false,
+      filterBadge: 'all',
+      filterShortOnly: false,
+      filterPriceOnly: false
     };
 
     // WATCHLIST(増分9。localStorageのみ・端末間同期なし・寛容パース。
@@ -1777,6 +1822,85 @@
         '<time datetime="' + escapeHtml(state.meta.latest_week) + '">' + escapeHtml(state.meta.latest_week) + '</time>' + detail + '</div>';
     }
 
+    // FILTER(増分13 PWA側。条件フィルタ検索。v2-policy.md論点A裁定=順位・スコアなし)
+    function isFilterActive() {
+      return state.filterBadge !== 'all' || state.filterShortOnly || state.filterPriceOnly;
+    }
+
+    // signals未取得(未fetch・fetch中・取得失敗)の間は「該当なし」扱いにする(誤って全件表示しない)
+    function issueMatchesFilter(issue) {
+      if (!isFilterActive()) return true;
+      if (!state.signals || !state.signals.issues) return false;
+      const signal = state.signals.issues[issue.code];
+      if (!signal) return false;
+      if (state.filterBadge !== 'all' && signal.badge !== state.filterBadge) return false;
+      if (state.filterShortOnly && !signal.short) return false;
+      if (state.filterPriceOnly && !signal.price) return false;
+      return true;
+    }
+
+    // フィルタが「すべて+トグル両オフ」から動いた時だけ1回fetchする(既定状態では絶対にfetchしない=回帰なし)。
+    // 失敗時は既定へ戻す(呼び出し元のhandleFilterChangeが後始末する)
+    async function ensureSignalsLoaded() {
+      if (!isFilterActive() || state.signals || state.signalsLoading) return;
+      state.signalsLoading = true;
+      try {
+        const payload = await fetchJson(DATA_PATHS.signals);
+        if (!payload || !payload.issues || typeof payload.issues !== 'object') {
+          throw new Error('signals.json の形式が不正です。');
+        }
+        state.signals = payload;
+      } catch (error) {
+        state.signalsError = error;
+        state.signalsErrorPending = true;
+        state.filterBadge = 'all';
+        state.filterShortOnly = false;
+        state.filterPriceOnly = false;
+      } finally {
+        state.signalsLoading = false;
+      }
+    }
+
+    function filterChipsHtml() {
+      const badgeRow = '<div class="filter-chip-row" role="group" aria-label="バッジで絞り込み">' +
+        FILTER_BADGE_OPTIONS.map(function (opt) {
+          const active = state.filterBadge === opt.key;
+          return '<button type="button" class="filter-chip' + (active ? ' filter-chip-active' : '') + '" data-filter-badge="' + opt.key + '" aria-pressed="' + active + '">' + escapeHtml(opt.label) + '</button>';
+        }).join('') +
+      '</div>';
+      const toggleRow = '<div class="filter-chip-row" role="group" aria-label="追加条件で絞り込み">' +
+        '<button type="button" class="filter-chip' + (state.filterShortOnly ? ' filter-chip-active' : '') + '" data-filter-toggle="short" aria-pressed="' + state.filterShortOnly + '">大口空売りあり</button>' +
+        '<button type="button" class="filter-chip' + (state.filterPriceOnly ? ' filter-chip-active' : '') + '" data-filter-toggle="price" aria-pressed="' + state.filterPriceOnly + '">株価収録のみ</button>' +
+      '</div>';
+      const weekPart = state.signals && typeof state.signals.week === 'string' ? '（' + escapeHtml(state.signals.week) + '時点）' : '';
+      const note = '<p class="filter-note">シグナルは週次データ' + weekPart + 'による機械的な判定です。銘柄の推奨ではありません。</p>';
+      return badgeRow + toggleRow + note;
+    }
+
+    function patchFilterChips() {
+      const panel = document.getElementById('filter-panel');
+      if (panel) panel.innerHTML = filterChipsHtml();
+    }
+
+    async function handleFilterChange() {
+      patchFilterChips();
+      await ensureSignalsLoaded();
+      patchFilterChips();
+      patchSearchResults();
+    }
+
+    function setFilterBadge(key) {
+      if (state.filterBadge === key) return;
+      state.filterBadge = key;
+      handleFilterChange();
+    }
+
+    function toggleFilterToggle(kind) {
+      if (kind === 'short') state.filterShortOnly = !state.filterShortOnly;
+      else if (kind === 'price') state.filterPriceOnly = !state.filterPriceOnly;
+      handleFilterChange();
+    }
+
     function renderSearchPage() {
       state.currentChart = null;
       state.currentTaishakuChart = null;
@@ -1793,6 +1917,7 @@
           '<div class="search-box">' +
             '<input id="issue-search" type="search" inputmode="search" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="例：285A / キオクシア" value="' + escapeHtml(state.query) + '" aria-label="銘柄コードまたは銘柄名">' +
           '</div>' +
+          '<div id="filter-panel" class="filter-panel">' + filterChipsHtml() + '</div>' +
           '<p id="result-summary" class="result-summary"></p>' +
           '<ul id="result-list" class="result-list"></ul>' +
         '</section>';
@@ -1810,8 +1935,17 @@
         return;
       }
 
+      if (state.signalsErrorPending) {
+        summary.textContent = 'シグナルデータを取得できません。';
+        list.replaceChildren();
+        state.signalsErrorPending = false; // 一度表示したら消費する(以降は既定に戻った通常検索に自然移行)
+        return;
+      }
+
       const normalized = normalizeSearch(state.query);
-      if (!normalized) {
+      const filterActive = isFilterActive();
+
+      if (!normalized && !filterActive) {
         summary.textContent = state.issues.length ? '銘柄コードまたは銘柄名を入力してください（' + NUMBER_FORMAT.format(state.issues.length) + '銘柄）' : '銘柄データを読み込んでいます…';
         list.replaceChildren();
         return;
@@ -1820,15 +1954,30 @@
       const matches = [];
       for (let index = 0; index < state.issues.length; index += 1) {
         const issue = state.issues[index];
-        if (issue.searchText.indexOf(normalized) !== -1) matches.push(issue);
+        const textOk = !normalized || issue.searchText.indexOf(normalized) !== -1;
+        if (textOk && issueMatchesFilter(issue)) matches.push(issue);
         if (matches.length >= RESULT_LIMIT) break;
       }
 
-      summary.textContent = matches.length ? matches.length + (matches.length === RESULT_LIMIT ? '件以上' : '件') + '見つかりました' : '該当する銘柄がありません';
+      if (filterActive) {
+        summary.textContent = matches.length
+          ? '該当' + matches.length + '件' + (matches.length >= RESULT_LIMIT ? '（' + RESULT_LIMIT + '件まで表示）' : '')
+          : '該当する銘柄がありません';
+      } else {
+        summary.textContent = matches.length ? matches.length + (matches.length === RESULT_LIMIT ? '件以上' : '件') + '見つかりました' : '該当する銘柄がありません';
+      }
+
       list.innerHTML = matches.map(function (issue) {
+        const signal = filterActive && state.signals && state.signals.issues ? state.signals.issues[issue.code] : null;
+        const badgeHtml = signal && signal.badge
+          ? '<span class="result-badge"><span class="badge-dot ' + (SIGNAL_BADGE_DOT_CLASS[signal.badge] || 'badge-dot-gray') + '"></span>' + escapeHtml(BADGE_LABELS[signal.badge] || signal.badge) + '</span>'
+          : '';
         return '<li><a class="result-link" href="#/issue/' + encodeURIComponent(issue.code) + '">' +
-          '<span class="result-name">' + escapeHtml(issue.name) + '</span>' +
-          '<span class="issue-code">' + escapeHtml(issue.code) + '</span>' +
+          '<span class="result-link-main">' +
+            '<span class="result-name">' + escapeHtml(issue.name) + '</span>' +
+            '<span class="issue-code">' + escapeHtml(issue.code) + '</span>' +
+          '</span>' +
+          badgeHtml +
         '</a></li>';
       }).join('');
     }
@@ -2257,6 +2406,7 @@
             '<li>銘柄ごとに、機関投資家が「株を借りている量」(借株残)の推移を確認できます。</li>' +
             '<li>発行済株式の0.5%以上の大口空売り残高が、どの機関からどれだけ報告されているかを確認できます。</li>' +
             '<li>借株残の増減と株価の動きを重ねて見ることで、需給(買いたい人と売りたい人のバランス)の変化をつかみやすくします。</li>' +
+            '<li>トップページの検索欄の下にあるフィルタを使うと、「買い戻し進行中の銘柄だけ」のようにシグナルの種類で絞り込んで一覧表示できます(判定は最新の週次データの時点のもので、銘柄の推奨ではありません)。</li>' +
           '</ul>' +
         '</section>' +
         '<section class="card guide-section" aria-labelledby="guide-2-title">' +
@@ -2383,6 +2533,16 @@
       if (removeButton) {
         removeFromWatchlist(removeButton.getAttribute('data-watch-remove'));
         if (state.route.type === 'watch') render(); // 一覧からその場で消えるよう再描画
+        return;
+      }
+      const badgeChip = event.target.closest('[data-filter-badge]');
+      if (badgeChip) {
+        setFilterBadge(badgeChip.getAttribute('data-filter-badge'));
+        return;
+      }
+      const toggleChip = event.target.closest('[data-filter-toggle]');
+      if (toggleChip) {
+        toggleFilterToggle(toggleChip.getAttribute('data-filter-toggle'));
       }
     }
 
