@@ -198,9 +198,14 @@ class BuildSiteTests(unittest.TestCase):
         self.assertIsNotNone(s28["lend_qty"][1])
 
     def test_sibling_dirs_preserved_and_stale_shards_removed(self):
-        # short/prices(別ビルダー所有)は保全し、消滅shardのseriesは丸ごと入れ替わる
+        # short/prices(別ビルダー所有)は保全し、消滅shardのseriesは丸ごと入れ替わる。
+        # 増分13でbuild_siteがsignals.json算出のためshort/を読むようになったため、
+        # sentinelも(空でよいので)最小限の妥当なshort shard形にしておく
         (self.out_dir / "short").mkdir(parents=True)
-        (self.out_dir / "short" / "keep.json").write_text("{}", encoding="utf-8")
+        (self.out_dir / "short" / "keep.json").write_text(
+            json.dumps({"schema_version": "supply_demand_short_v1", "issues": {}}),
+            encoding="utf-8",
+        )
         (self.out_dir / "series").mkdir()
         (self.out_dir / "series" / "ZZ.json").write_text("{}", encoding="utf-8")
         self._write_week("2026-07-10")
@@ -249,6 +254,159 @@ class BuildSiteTests(unittest.TestCase):
         self.assertEqual(meta["weekly_count"], 160)
         self.assertEqual(meta["latest_week"], all_dates[-1])
 
+    # ---- 増分13: signals.json ----------------------------------------
+    # index.htmlのcomputeBorrowIndicator/computeShortIndicator/computeSignalBadge
+    # と同一閾値(境界値含む)であることを、まず純粋関数レベルで固定化する。
+
+    def test_borrow_indicator_boundary_plus_10_percent_is_increase(self):
+        borrow = [100, 100, 100, 100, 1000, 100, 100, 100, 1100]  # 9件=有効週8以上
+        indicator = build_site._compute_borrow_indicator(borrow)
+        self.assertEqual(indicator["status"], "ok")
+        self.assertAlmostEqual(indicator["change_ratio"], 0.10)
+        self.assertEqual(indicator["direction"], "increase")
+
+    def test_borrow_indicator_boundary_minus_10_percent_is_decrease(self):
+        borrow = [100, 100, 100, 100, 1000, 100, 100, 100, 900]
+        indicator = build_site._compute_borrow_indicator(borrow)
+        self.assertAlmostEqual(indicator["change_ratio"], -0.10)
+        self.assertEqual(indicator["direction"], "decrease")
+
+    def test_borrow_indicator_just_inside_threshold_is_neutral(self):
+        # ±10%のすぐ内側(9.99%)はneutral(境界の反対側も固定化)
+        borrow = [100, 100, 100, 100, 1000, 100, 100, 100, 1099]
+        indicator = build_site._compute_borrow_indicator(borrow)
+        self.assertEqual(indicator["direction"], "neutral")
+
+    def test_borrow_indicator_insufficient_at_exactly_7_valid_weeks(self):
+        borrow = [1, 2, 3, 4, 5, 6, 7]  # 有効週7 < MIN_VALID_WEEKS(8)
+        indicator = build_site._compute_borrow_indicator(borrow)
+        self.assertEqual(indicator["status"], "insufficient")
+        self.assertEqual(indicator["direction"], "neutral")
+        self.assertIsNone(indicator["change_ratio"])
+
+    def test_borrow_indicator_ok_at_exactly_8_valid_weeks(self):
+        # 7週の対になる境界(8週ちょうどはinsufficientから外れる)
+        borrow = [1, 2, 3, 4, 100, 6, 7, 110]
+        indicator = build_site._compute_borrow_indicator(borrow)
+        self.assertNotEqual(indicator["status"], "insufficient")
+
+    def test_short_indicator_boundary_plus_0_5pt_is_increase(self):
+        # (0.020-0.015)*100 はIEEE754上0.5000000000000001になる(index.htmlの
+        # JS実装も同じ浮動小数点演算なので、この境界挙動はポート元と一致させる
+        # べき仕様。0.010/0.015のような組は(0.015-0.010)*100=0.49999999999999994
+        # に丸め落ちして境界を跨がないため使わない)
+        events = [
+            {"date": "2026-06-20", "ratio": 0.015, "seller": "A"},  # prior基準日以前
+            {"date": "2026-07-22", "ratio": 0.020, "seller": "A"},  # latest
+        ]
+        indicator = build_site._compute_short_indicator(events)
+        self.assertEqual(indicator["status"], "ok")
+        self.assertEqual(indicator["direction"], "increase")
+
+    def test_short_indicator_boundary_minus_0_5pt_is_decrease(self):
+        events = [
+            {"date": "2026-06-20", "ratio": 0.020, "seller": "A"},
+            {"date": "2026-07-22", "ratio": 0.015, "seller": "A"},
+        ]
+        indicator = build_site._compute_short_indicator(events)
+        self.assertEqual(indicator["direction"], "decrease")
+
+    def test_short_indicator_just_inside_threshold_is_neutral(self):
+        events = [
+            {"date": "2026-06-20", "ratio": 0.010, "seller": "A"},
+            {"date": "2026-07-22", "ratio": 0.0149, "seller": "A"},  # +0.49pt
+        ]
+        indicator = build_site._compute_short_indicator(events)
+        self.assertEqual(indicator["direction"], "neutral")
+
+    def test_signal_below_threshold_only_sums_to_zero_short_is_false(self):
+        series = {"own_qty": [1, 1, 1, 1, 1, 1, 1, 1], "ten_qty": [1, 1, 1, 1, 1, 1, 1, 1]}
+        events = [
+            {"date": "2026-07-22", "ratio": 0.0, "qty": None, "seller": "A", "below_threshold": True}
+        ]
+        signal = build_site._compute_signal(series, events, set(), "1301")
+        self.assertFalse(signal["short"])
+
+    def test_signal_no_short_reports_is_false_and_neutral(self):
+        series = {"own_qty": [None] * 8, "ten_qty": [None] * 8}
+        signal = build_site._compute_signal(series, [], set(), "1301")
+        self.assertFalse(signal["short"])
+        self.assertEqual(signal["badge"], "insufficient")  # borrowも欠測のため
+
+    def test_signal_price_flag_reflects_price_list_membership(self):
+        series = {"own_qty": [None] * 8, "ten_qty": [None] * 8}
+        self.assertTrue(build_site._compute_signal(series, [], {"1301"}, "1301")["price"])
+        self.assertFalse(build_site._compute_signal(series, [], {"9999"}, "1301")["price"])
+
+    def test_load_price_codes_missing_file_returns_empty_set(self):
+        self.assertEqual(build_site._load_price_codes(self.root / "no-such.json"), set())
+
+    def test_load_price_codes_malformed_file_fails_loudly(self):
+        path = self.root / "price_list.json"
+        path.write_text("not json", encoding="utf-8")
+        with self.assertRaises(build_site.BuildSiteError):
+            build_site._load_price_codes(path)
+
+    def test_load_short_events_missing_directory_returns_empty_map(self):
+        self.assertEqual(build_site._load_short_events(self.root / "no-such-dir"), {})
+
+    def test_load_short_events_malformed_shard_fails_loudly(self):
+        short_dir = self.root / "short"
+        short_dir.mkdir()
+        (short_dir / "13.json").write_text('{"schema_version": "x"}', encoding="utf-8")
+        with self.assertRaises(build_site.BuildSiteError):
+            build_site._load_short_events(short_dir)
+
+    # ---- 増分13: build_site()経由の配線確認(実fixture) ------------------
+
+    def test_signals_json_schema_and_price_short_wiring(self):
+        dates = ["2026-06-26", "2026-07-03", "2026-07-10"]
+        for report_date in dates:
+            self._write_week(report_date)
+
+        price_list_path = self.root / "price_list.json"
+        price_list_path.write_text(json.dumps({"codes": ["285A"]}), encoding="utf-8")
+        short_dir = self.root / "short_data"
+        short_dir.mkdir()
+        (short_dir / "28.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "supply_demand_short_v1",
+                    "issues": {
+                        "285A": {
+                            "name": "キオクシアホールディングス",
+                            "events": [],  # 報告履歴なし
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        build_site.build_site(
+            self.weekly_dir,
+            self.out_dir,
+            GENERATED_AT,
+            short_dir=short_dir,
+            price_list_path=price_list_path,
+        )
+
+        signals = self._read_output("signals.json")
+        self.assertEqual(signals["schema_version"], 1)
+        self.assertEqual(signals["week"], dates[-1])
+        kioxia = signals["issues"]["285A"]
+        self.assertEqual(set(kioxia), {"badge", "borrow_chg", "short", "price"})
+        self.assertTrue(kioxia["price"])
+        self.assertFalse(kioxia["short"])  # events空=報告なし
+        koyo = signals["issues"]["1301"]
+        self.assertFalse(koyo["price"])
+        # 順位・スコアは持たせない契約: 4フィールド以外何も無い
+        for issue in signals["issues"].values():
+            self.assertEqual(set(issue), {"badge", "borrow_chg", "short", "price"})
+
+    def test_signals_all_short_false_when_short_dir_missing(self):
+        self._write_week("2026-07-10")
+        build_site.build_site(
 
 if __name__ == "__main__":
     unittest.main()
