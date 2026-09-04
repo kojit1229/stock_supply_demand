@@ -1,0 +1,15 @@
+{
+  "name": "需給ナビ",
+  "short_name": "需給ナビ",
+  "description": "JSDA週次貸借残高を銘柄別に確認する研究・分析ツール",
+  "lang": "ja",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0B1118",
+  "theme_color": "#111821",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
